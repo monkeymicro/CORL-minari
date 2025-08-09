@@ -13,9 +13,9 @@ from functools import partial
 from typing import Any, Callable, Dict, Sequence, Tuple, Union
 
 import chex
-import d4rl  # noqa
+import minari  # noqa
 import flax.linen as nn
-import gym
+import gymnasium as gym
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -53,7 +53,7 @@ class Config:
     policy_freq: int = 2
     normalize_q: bool = True
     # training params
-    dataset_name: str = "halfcheetah-medium-v2"
+    dataset_name: str = 'mujoco/hopper/expert-v0'
     batch_size: int = 1024
     num_epochs: int = 1000
     num_updates_on_epoch: int = 1000
@@ -267,6 +267,33 @@ def compute_mean_std(states: jax.Array, eps: float) -> Tuple[jax.Array, jax.Arra
 def normalize_states(states: jax.Array, mean: jax.Array, std: jax.Array) -> jax.Array:
     return (states - mean) / std
 
+# 假设你已有的 ReplayBuffer 类如下（简化）：
+class SimpleReplayBuffer:
+    def __init__(self, obs_dim: int, action_dim: int, size: int,):
+        self._states = np.zeros([size, obs_dim], dtype=np.float32)
+        self._actions = np.zeros([size, action_dim], dtype=np.float32)
+        self._rewards = np.zeros([size], dtype=np.float32)
+        self._next_states = np.zeros([size, obs_dim], dtype=np.float32)
+        self._dones = np.zeros([size], dtype=np.float32)
+        self._next_actions = np.zeros([size, action_dim], dtype=np.float32)
+        self.max_size = size
+        self.ptr, self.size, = 0, 0
+    def store(self, obs: np.ndarray,
+        act: np.ndarray, 
+        rew: float, 
+        next_obs: np.ndarray, 
+        done: float,
+        next_act: np.ndarray):
+
+        self._states[self.ptr] = obs
+        self._next_states[self.ptr] = next_obs
+        self._actions[self.ptr] = act
+        self._rewards[self.ptr] = rew
+        self._dones[self.ptr] = done
+        self._next_actions[self.ptr] = next_act
+        self.ptr = (self.ptr + 1) % self.max_size
+        self.size = min(self.size + 1, self.max_size)
+        # print(f"Loaded {len(data['observations'])} transitions.")
 
 @chex.dataclass
 class ReplayBuffer:
@@ -274,22 +301,53 @@ class ReplayBuffer:
     mean: float = 0
     std: float = 1
 
-    def create_from_d4rl(
+    def create_from_minari(
         self,
         dataset_name: str,
         normalize_reward: bool = False,
         is_normalize: bool = False,
     ):
-        d4rl_data = qlearning_dataset(gym.make(dataset_name))
+        manari_dataset = minari.load_dataset(dataset_name)
+        print('minari dataset len is :', manari_dataset.total_steps)
+        # 获取维度信息
+        state_dim = manari_dataset.observation_space.shape[0]
+        action_dim = manari_dataset.action_space.shape[0]
+
+        # 创建你的 ReplayBuffer
+        buffer = SimpleReplayBuffer(state_dim, action_dim, manari_dataset.total_steps)
+
+        # 使用 iterate_episodes 来提取数据
+        for ep in manari_dataset.iterate_episodes():
+            for i in range(ep.observations.shape[0] - 2):
+                obs = ep.observations[i]
+                # print(obs)
+                next_obs = ep.observations[i+1]
+                action = ep.actions[i]
+                next_action = ep.actions[i+1]
+                reward = ep.rewards[i]
+                done = (ep.terminations | ep.truncations)[i].astype(np.float32)
+
+                buffer.store(obs, action, reward, next_obs, done, next_action)
+
+        print("Replay buffer filled.")
+        
+        dataset = {
+                "observations": buffer._states,
+                "actions": buffer._actions,
+                "next_actions": buffer._next_actions,
+                "rewards": buffer._rewards,
+                "next_observations": buffer._next_states,
+                "terminals": buffer._dones,
+        }
         buffer = {
-            "states": jnp.asarray(d4rl_data["observations"], dtype=jnp.float32),
-            "actions": jnp.asarray(d4rl_data["actions"], dtype=jnp.float32),
-            "rewards": jnp.asarray(d4rl_data["rewards"], dtype=jnp.float32),
+            "states": jnp.asarray(dataset["observations"], dtype=jnp.float32),
+            "actions": jnp.asarray(dataset["actions"], dtype=jnp.float32),
+            "rewards": jnp.asarray(dataset["rewards"], dtype=jnp.float32),
             "next_states": jnp.asarray(
-                d4rl_data["next_observations"], dtype=jnp.float32
+                dataset["next_observations"], dtype=jnp.float32
             ),
-            "next_actions": jnp.asarray(d4rl_data["next_actions"], dtype=jnp.float32),
-            "dones": jnp.asarray(d4rl_data["terminals"], dtype=jnp.float32),
+            "next_actions": jnp.asarray(dataset["next_actions"], dtype=jnp.float32),
+            "dones": jnp.asarray(dataset["terminals"], dtype=jnp.float32),
         }
         if is_normalize:
             self.mean, self.std = compute_mean_std(buffer["states"], eps=1e-3)
@@ -397,17 +455,20 @@ def evaluate(
     num_episodes: int,
     seed: int,
 ) -> np.ndarray:
-    env.seed(seed)
+    # env.seed(seed)
     env.action_space.seed(seed)
     env.observation_space.seed(seed)
 
     returns = []
     for _ in trange(num_episodes, desc="Eval", leave=False):
-        obs, done = env.reset(), False
+        obs, _ = env.reset(seed=seed)
+        done = False
         total_reward = 0.0
         while not done:
             action = np.asarray(jax.device_get(action_fn(params, obs)))
-            obs, reward, done, _ = env.step(action)
+            # obs, reward, done, _ = env.step(action)
+            obs, reward, terminated, truncated, _= env.step(action)
+            done = terminated or truncated
             total_reward += reward
         returns.append(total_reward)
 
@@ -597,24 +658,26 @@ def main(config: Config):
     dict_config = asdict(config)
     dict_config["mlc_job_name"] = os.environ.get("PLATFORM_JOB_NAME")
 
-    wandb.init(
-        config=dict_config,
-        project=config.project,
-        group=config.group,
-        name=config.name,
-        id=str(uuid.uuid4()),
-    )
-    wandb.mark_preempting()
+    # wandb.init(
+    #     config=dict_config,
+    #     project=config.project,
+    #     group=config.group,
+    #     name=config.name,
+    #     id=str(uuid.uuid4()),
+    # )
+    # wandb.mark_preempting()
     buffer = ReplayBuffer()
-    buffer.create_from_d4rl(
+    buffer.create_from_minari(
         config.dataset_name, config.normalize_reward, config.normalize_states
     )
 
     key = jax.random.PRNGKey(seed=config.train_seed)
     key, actor_key, critic_key = jax.random.split(key, 3)
 
-    eval_env = make_env(config.dataset_name, seed=config.eval_seed)
-    eval_env = wrap_env(eval_env, buffer.mean, buffer.std)
+    # eval_env = make_env(config.dataset_name, seed=config.eval_seed)
+    # eval_env = wrap_env(eval_env, buffer.mean, buffer.std)
+    eval_env = gym.make('Hopper-v5', ctrl_cost_weight=1e-3)
+
     init_state = buffer.data["states"][0][None, ...]
     init_action = buffer.data["actions"][0][None, ...]
 
@@ -731,10 +794,10 @@ def main(config: Config):
             init_val=update_carry,
         )
         # log mean over epoch for each metric
-        mean_metrics = update_carry["metrics"].compute()
-        wandb.log(
-            {"epoch": epoch, **{f"ReBRAC/{k}": v for k, v in mean_metrics.items()}}
-        )
+        # mean_metrics = update_carry["metrics"].compute()
+        # wandb.log(
+        #     {"epoch": epoch, **{f"ReBRAC/{k}": v for k, v in mean_metrics.items()}}
+        # )
 
         if epoch % config.eval_every == 0 or epoch == config.num_epochs - 1:
             eval_returns = evaluate(
@@ -744,16 +807,23 @@ def main(config: Config):
                 config.eval_episodes,
                 seed=config.eval_seed,
             )
-            normalized_score = eval_env.get_normalized_score(eval_returns) * 100.0
-            wandb.log(
-                {
-                    "epoch": epoch,
-                    "eval/return_mean": np.mean(eval_returns),
-                    "eval/return_std": np.std(eval_returns),
-                    "eval/normalized_score_mean": np.mean(normalized_score),
-                    "eval/normalized_score_std": np.std(normalized_score),
-                }
+            # normalized_score = eval_env.get_normalized_score(eval_returns) * 100.0
+            # wandb.log(
+            #     {
+            #         "epoch": epoch,
+            #         "eval/return_mean": np.mean(eval_returns),
+            #         "eval/return_std": np.std(eval_returns),
+            #         "eval/normalized_score_mean": np.mean(normalized_score),
+            #         "eval/normalized_score_std": np.std(normalized_score),
+            #     }
+            # )
+            eval_score = eval_returns.mean()
+            print("---------------------------------------")
+            print(
+                f"Evaluation over {config.eval_episodes} episodes: "
+                f"{eval_score:.3f} , Minari score mean: {eval_score:.3f}"
             )
+            print("---------------------------------------")
 
 
 if __name__ == "__main__":

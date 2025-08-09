@@ -8,8 +8,8 @@ from collections import defaultdict
 from dataclasses import asdict, dataclass
 from typing import Any, DefaultDict, Dict, List, Optional, Tuple, Union
 
-import d4rl  # noqa
-import gym
+import minari  # noqa
+import gymnasium as gym
 import numpy as np
 import pyrallis
 import torch
@@ -36,7 +36,7 @@ class TrainConfig:
     embedding_dropout: float = 0.1
     max_action: float = 1.0
     # training params
-    env_name: str = "halfcheetah-medium-v2"
+    env_name: str = 'mujoco/hopper/expert-v0'
     learning_rate: float = 1e-4
     betas: Tuple[float, float] = (0.9, 0.999)
     weight_decay: float = 1e-4
@@ -61,7 +61,6 @@ class TrainConfig:
         self.name = f"{self.name}-{self.env_name}-{str(uuid.uuid4())[:8]}"
         if self.checkpoints_path is not None:
             self.checkpoints_path = os.path.join(self.checkpoints_path, self.name)
-
 
 # general utils
 def set_seed(
@@ -127,7 +126,7 @@ def discounted_cumsum(x: np.ndarray, gamma: float) -> np.ndarray:
     return cumsum
 
 
-def load_d4rl_trajectories(
+def load_minari_trajectories(
     env_name: str, gamma: float = 1.0
 ) -> Tuple[List[DefaultDict[str, np.ndarray]], Dict[str, Any]]:
     dataset = gym.make(env_name).get_dataset()

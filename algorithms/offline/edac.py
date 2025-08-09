@@ -9,8 +9,8 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import d4rl
-import gym
+import minari
+import gymnasium as gym
 import numpy as np
 import pyrallis
 import torch
@@ -23,7 +23,7 @@ from tqdm import trange
 class TrainConfig:
     # wandb params
     project: str = "CORL"
-    group: str = "EDAC-D4RL"
+    group: str = "EDAC-MINARI"
     name: str = "EDAC"
     # model params
     hidden_dim: int = 256
@@ -37,7 +37,7 @@ class TrainConfig:
     max_action: float = 1.0
     # training params
     buffer_size: int = 1_000_000
-    env_name: str = "halfcheetah-medium-v2"
+    env_name: str = 'mujoco/hopper/expert-v0'
     batch_size: int = 256
     num_epochs: int = 3000
     num_updates_on_epoch: int = 1000
@@ -137,8 +137,8 @@ class ReplayBuffer:
     def _to_tensor(self, data: np.ndarray) -> torch.Tensor:
         return torch.tensor(data, dtype=torch.float32, device=self._device)
 
-    # Loads data in d4rl format, i.e. from Dict[str, np.array].
-    def load_d4rl_dataset(self, data: Dict[str, np.ndarray]):
+    # Loads data in minari, i.e. from Dict[str, np.array].
+    def load_minari_dataset(self, data: Dict[str, np.ndarray]):
         if self._size != 0:
             raise ValueError("Trying to load data into non-empty replay buffer")
         n_transitions = data["observations"].shape[0]
@@ -497,22 +497,25 @@ class EDAC:
 
 @torch.no_grad()
 def eval_actor(
-    env: gym.Env, actor: Actor, device: str, n_episodes: int, seed: int
+    env: gym.Env, actor: nn.Module, device: str, n_episodes: int, seed: int
 ) -> np.ndarray:
-    env.seed(seed)
+    # env.seed(seed)
     actor.eval()
     episode_rewards = []
     for _ in range(n_episodes):
-        state, done = env.reset(), False
+        state, _ = env.reset(seed=seed)
+        done = False
         episode_reward = 0.0
         while not done:
-            action = actor.act(state, device)
-            state, reward, done, _ = env.step(action)
+            action = actor.act(torch.FloatTensor(state), device)
+            # state, reward, done, _ = env.step(action)
+            state, reward, terminated, truncated, _= env.step(action)
+            done = terminated or truncated
             episode_reward += reward
         episode_rewards.append(episode_reward)
 
     actor.train()
-    return np.array(episode_rewards)
+    return np.asarray(episode_rewards)
 
 
 def return_reward_range(dataset, max_episode_steps):
@@ -538,29 +541,85 @@ def modify_reward(dataset, env_name, max_episode_steps=1000):
     elif "antmaze" in env_name:
         dataset["rewards"] -= 1.0
 
+# 假设你已有的 ReplayBuffer 类如下（简化）：
+class SimpleReplayBuffer:
+    def __init__(self, obs_dim: int, action_dim: int, size: int,):
+        self._states = np.zeros([size, obs_dim], dtype=np.float32)
+        self._actions = np.zeros([size, action_dim], dtype=np.float32)
+        self._rewards = np.zeros([size], dtype=np.float32)
+        self._next_states = np.zeros([size, obs_dim], dtype=np.float32)
+        self._dones = np.zeros([size], dtype=np.float32)
+        self.max_size = size
+        self.ptr, self.size, = 0, 0
+    def store(self, obs: np.ndarray,
+        act: np.ndarray, 
+        rew: float, 
+        next_obs: np.ndarray, 
+        done: float,):
+
+        self._states[self.ptr] = obs
+        self._next_states[self.ptr] = next_obs
+        self._actions[self.ptr] = act
+        self._rewards[self.ptr] = rew
+        self._dones[self.ptr] = done
+        self.ptr = (self.ptr + 1) % self.max_size
+        self.size = min(self.size + 1, self.max_size)
+        # print(f"Loaded {len(data['observations'])} transitions.")
 
 @pyrallis.wrap()
 def train(config: TrainConfig):
-    set_seed(config.train_seed, deterministic_torch=config.deterministic_torch)
-    wandb_init(asdict(config))
+    # set_seed(config.train_seed, deterministic_torch=config.deterministic_torch)
+    # wandb_init(asdict(config))
 
-    # data, evaluation, env setup
-    eval_env = wrap_env(gym.make(config.env_name))
-    state_dim = eval_env.observation_space.shape[0]
-    action_dim = eval_env.action_space.shape[0]
+    # # data, evaluation, env setup
+    # eval_env = wrap_env(gym.make(config.env_name))
+    # state_dim = eval_env.observation_space.shape[0]
+    # action_dim = eval_env.action_space.shape[0]
 
-    d4rl_dataset = d4rl.qlearning_dataset(eval_env)
+    # d4rl_dataset = d4rl.qlearning_dataset(eval_env)
 
-    if config.normalize_reward:
-        modify_reward(d4rl_dataset, config.env_name)
+    # if config.normalize_reward:
+    #     modify_reward(d4rl_dataset, config.env_name)
 
-    buffer = ReplayBuffer(
-        state_dim=state_dim,
-        action_dim=action_dim,
-        buffer_size=config.buffer_size,
-        device=config.device,
+    manari_dataset = minari.load_dataset(config.env_name)
+    print('minari dataset len is :', manari_dataset.total_steps)
+    # 获取维度信息
+    state_dim = manari_dataset.observation_space.shape[0]
+    action_dim = manari_dataset.action_space.shape[0]
+
+    # 创建你的 ReplayBuffer
+    buffer = SimpleReplayBuffer(state_dim, action_dim, manari_dataset.total_steps)
+
+    # 使用 iterate_episodes 来提取数据
+    for ep in manari_dataset.iterate_episodes():
+        for i in range(ep.observations.shape[0] - 1):
+            obs = ep.observations[i]
+            # print(obs)
+            next_obs = ep.observations[i+1]
+            action = ep.actions[i]
+            reward = ep.rewards[i]
+            done = (ep.terminations | ep.truncations)[i].astype(np.float32)
+
+            buffer.store(obs, action, reward, next_obs, done)
+
+    print("Replay buffer filled.")
+    
+    dataset = {
+            "observations": buffer._states,
+            "actions": buffer._actions,
+            "rewards": buffer._rewards,
+            "next_observations": buffer._next_states,
+            "terminals": buffer._dones,
+        }
+
+    replay_buffer = ReplayBuffer(
+        state_dim,
+        action_dim,
+        manari_dataset.total_steps,
+        config.device,
     )
-    buffer.load_d4rl_dataset(d4rl_dataset)
+    replay_buffer.load_minari_dataset(dataset)
+    env = gym.make('Hopper-v5', ctrl_cost_weight=1e-3)
 
     # Actor & Critic setup
     actor = Actor(state_dim, action_dim, config.hidden_dim, config.max_action)
@@ -596,34 +655,31 @@ def train(config: TrainConfig):
     for epoch in trange(config.num_epochs, desc="Training"):
         # training
         for _ in trange(config.num_updates_on_epoch, desc="Epoch", leave=False):
-            batch = buffer.sample(config.batch_size)
+            batch = replay_buffer.sample(config.batch_size)
             update_info = trainer.update(batch)
 
-            if total_updates % config.log_every == 0:
-                wandb.log({"epoch": epoch, **update_info})
+            # if total_updates % config.log_every == 0:
+            #     wandb.log({"epoch": epoch, **update_info})
 
             total_updates += 1
 
         # evaluation
         if epoch % config.eval_every == 0 or epoch == config.num_epochs - 1:
-            eval_returns = eval_actor(
-                env=eval_env,
+            eval_scores = eval_actor(
+                env=env,
                 actor=actor,
                 n_episodes=config.eval_episodes,
                 seed=config.eval_seed,
                 device=config.device,
             )
-            eval_log = {
-                "eval/reward_mean": np.mean(eval_returns),
-                "eval/reward_std": np.std(eval_returns),
-                "epoch": epoch,
-            }
-            if hasattr(eval_env, "get_normalized_score"):
-                normalized_score = eval_env.get_normalized_score(eval_returns) * 100.0
-                eval_log["eval/normalized_score_mean"] = np.mean(normalized_score)
-                eval_log["eval/normalized_score_std"] = np.std(normalized_score)
-
-            wandb.log(eval_log)
+            eval_score = eval_scores.mean()
+            print("---------------------------------------")
+            print(
+                f"Evaluation over {config.eval_episodes} episodes: "
+                f"{eval_score:.3f} , Minari score mean: {eval_score:.3f}"
+            )
+            print("---------------------------------------")
+            # wandb.log(eval_log)
 
             if config.checkpoints_path is not None:
                 torch.save(
@@ -631,7 +687,7 @@ def train(config: TrainConfig):
                     os.path.join(config.checkpoints_path, f"{epoch}.pt"),
                 )
 
-    wandb.finish()
+    # wandb.finish()
 
 
 if __name__ == "__main__":

@@ -8,8 +8,9 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import d4rl
-import gym
+import minari
+# import d4rl
+import gymnasium as gym
 import numpy as np
 import pyrallis
 import torch
@@ -25,8 +26,9 @@ TensorBatch = List[torch.Tensor]
 class TrainConfig:
     # Experiment
     device: str = "cuda"
-    env: str = "halfcheetah-medium-expert-v2"  # OpenAI gym environment name
-    seed: int = 0  # Sets Gym, PyTorch and Numpy seeds
+    # env: str = 'mujoco/inverteddoublependulum/expert-v0'  # OpenAI gym environment name
+    env: str = 'mujoco/hopper/expert-v0'
+    seed: int = 1  # Sets Gym, PyTorch and Numpy seeds
     eval_freq: int = int(5e3)  # How often (time steps) we evaluate
     n_episodes: int = 10  # How many episodes run during evaluation
     max_timesteps: int = int(1e6)  # Max time steps to run environment
@@ -34,7 +36,7 @@ class TrainConfig:
     load_model: str = ""  # Model load file name, "" doesn't load
 
     # CQL
-    buffer_size: int = 2_000_000  # Replay buffer size
+    buffer_size: int = 1000_000  # Replay buffer size
     batch_size: int = 256  # Batch size for all networks
     discount: float = 0.99  # Discount factor
     alpha_multiplier: float = 1.0  # Multiplier for alpha in loss
@@ -68,7 +70,7 @@ class TrainConfig:
 
     # Wandb logging
     project: str = "CORL"
-    group: str = "CQL-D4RL"
+    group: str = "CQL-MINARI"
     name: str = "CQL"
 
     def __post_init__(self):
@@ -142,8 +144,8 @@ class ReplayBuffer:
     def _to_tensor(self, data: np.ndarray) -> torch.Tensor:
         return torch.tensor(data, dtype=torch.float32, device=self._device)
 
-    # Loads data in d4rl format, i.e. from Dict[str, np.array].
-    def load_d4rl_dataset(self, data: Dict[str, np.ndarray]):
+    # Loads data in minari, i.e. from Dict[str, np.array].
+    def load_minari_dataset(self, data: Dict[str, np.ndarray]):
         if self._size != 0:
             raise ValueError("Trying to load data into non-empty replay buffer")
         n_transitions = data["observations"].shape[0]
@@ -176,43 +178,46 @@ class ReplayBuffer:
         raise NotImplementedError
 
 
-def set_seed(
-    seed: int, env: Optional[gym.Env] = None, deterministic_torch: bool = False
-):
-    if env is not None:
-        env.seed(seed)
-        env.action_space.seed(seed)
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    np.random.seed(seed)
-    random.seed(seed)
-    torch.manual_seed(seed)
-    torch.use_deterministic_algorithms(deterministic_torch)
+# def set_seed(
+#     seed: int, env: Optional[gym.Env] = None, deterministic_torch: bool = False
+# ):
+#     if env is not None:
+#         env.seed(seed)
+#         env.action_space.seed(seed)
+#     os.environ["PYTHONHASHSEED"] = str(seed)
+#     np.random.seed(seed)
+#     random.seed(seed)
+#     torch.manual_seed(seed)
+#     torch.use_deterministic_algorithms(deterministic_torch)
 
 
-def wandb_init(config: dict) -> None:
-    wandb.init(
-        config=config,
-        project=config["project"],
-        group=config["group"],
-        name=config["name"],
-        id=str(uuid.uuid4()),
-    )
-    wandb.run.save()
+# def wandb_init(config: dict) -> None:
+#     wandb.init(
+#         config=config,
+#         project=config["project"],
+#         group=config["group"],
+#         name=config["name"],
+#         id=str(uuid.uuid4()),
+#     )
+#     wandb.run.save()
 
 
 @torch.no_grad()
 def eval_actor(
     env: gym.Env, actor: nn.Module, device: str, n_episodes: int, seed: int
 ) -> np.ndarray:
-    env.seed(seed)
+    # env.seed(seed)
     actor.eval()
     episode_rewards = []
     for _ in range(n_episodes):
-        state, done = env.reset(), False
+        state, _ = env.reset(seed=seed)
+        done = False
         episode_reward = 0.0
         while not done:
-            action = actor.act(state, device)
-            state, reward, done, _ = env.step(action)
+            action = actor.act(torch.FloatTensor(state), device)
+            # state, reward, done, _ = env.step(action)
+            state, reward, terminated, truncated, _= env.step(action)
+            done = terminated or truncated
             episode_reward += reward
         episode_rewards.append(episode_reward)
 
@@ -833,43 +838,103 @@ class ContinuousCQL:
         self.total_it = state_dict["total_it"]
 
 
+# 假设你已有的 ReplayBuffer 类如下（简化）：
+class SimpleReplayBuffer:
+    def __init__(self, obs_dim: int, action_dim: int, size: int,):
+        self._states = np.zeros([size, obs_dim], dtype=np.float32)
+        self._actions = np.zeros([size, action_dim], dtype=np.float32)
+        self._rewards = np.zeros([size], dtype=np.float32)
+        self._next_states = np.zeros([size, obs_dim], dtype=np.float32)
+        self._dones = np.zeros([size], dtype=np.float32)
+        self.max_size = size
+        self.ptr, self.size, = 0, 0
+    def store(self, obs: np.ndarray,
+        act: np.ndarray, 
+        rew: float, 
+        next_obs: np.ndarray, 
+        done: float,):
+
+        self._states[self.ptr] = obs
+        self._next_states[self.ptr] = next_obs
+        self._actions[self.ptr] = act
+        self._rewards[self.ptr] = rew
+        self._dones[self.ptr] = done
+        self.ptr = (self.ptr + 1) % self.max_size
+        self.size = min(self.size + 1, self.max_size)
+        # print(f"Loaded {len(data['observations'])} transitions.")
+
 @pyrallis.wrap()
 def train(config: TrainConfig):
-    env = gym.make(config.env)
+    # env = gym.make(config.env)
 
-    state_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.shape[0]
+    # state_dim = env.observation_space.shape[0]
+    # action_dim = env.action_space.shape[0]
 
-    dataset = d4rl.qlearning_dataset(env)
+    # 选择 Minari 数据集（需提前安装）
+    # dataset_name = 'mujoco/halfcheetah/medium-v0'
+    manari_dataset = minari.load_dataset(config.env)
+    print('minari dataset len is :', manari_dataset.total_steps)
+    # 获取维度信息
+    state_dim = manari_dataset.observation_space.shape[0]
+    action_dim = manari_dataset.action_space.shape[0]
 
-    if config.normalize_reward:
-        modify_reward(
-            dataset,
-            config.env,
-            reward_scale=config.reward_scale,
-            reward_bias=config.reward_bias,
-        )
+    # 创建你的 ReplayBuffer
+    buffer = SimpleReplayBuffer(state_dim, action_dim, manari_dataset.total_steps)
 
-    if config.normalize:
-        state_mean, state_std = compute_mean_std(dataset["observations"], eps=1e-3)
-    else:
-        state_mean, state_std = 0, 1
+    # 使用 iterate_episodes 来提取数据
+    for ep in manari_dataset.iterate_episodes():
+        for i in range(ep.observations.shape[0] - 1):
+            obs = ep.observations[i]
+            # print(obs)
+            next_obs = ep.observations[i+1]
+            action = ep.actions[i]
+            reward = ep.rewards[i]
+            done = (ep.terminations | ep.truncations)[i].astype(np.float32)
 
-    dataset["observations"] = normalize_states(
-        dataset["observations"], state_mean, state_std
-    )
-    dataset["next_observations"] = normalize_states(
-        dataset["next_observations"], state_mean, state_std
-    )
-    env = wrap_env(env, state_mean=state_mean, state_std=state_std)
+            buffer.store(obs, action, reward, next_obs, done)
+
+    print("Replay buffer filled.")
+    
+    dataset = {
+            "observations": buffer._states,
+            "actions": buffer._actions,
+            "rewards": buffer._rewards,
+            "next_observations": buffer._next_states,
+            "terminals": buffer._dones,
+        }
+    # dataset = d4rl.qlearning_dataset(env)
+
+    # if config.normalize_reward:
+    #     modify_reward(
+    #         dataset,
+    #         config.env,
+    #         reward_scale=config.reward_scale,
+    #         reward_bias=config.reward_bias,
+    #     )
+
+    # if config.normalize:
+    #     state_mean, state_std = compute_mean_std(dataset["observations"], eps=1e-3)
+    # else:
+    #     state_mean, state_std = 0, 1
+
+    # dataset["observations"] = normalize_states(
+    #     dataset["observations"], state_mean, state_std
+    # )
+    # dataset["next_observations"] = normalize_states(
+    #     dataset["next_observations"], state_mean, state_std
+    # )
+    # env = wrap_env(env, state_mean=state_mean, state_std=state_std)
+
     replay_buffer = ReplayBuffer(
         state_dim,
         action_dim,
-        config.buffer_size,
+        manari_dataset.total_steps,
         config.device,
     )
-    replay_buffer.load_d4rl_dataset(dataset)
+    replay_buffer.load_minari_dataset(dataset)
 
+    # env = gym.make('InvertedDoublePendulum-v5', healthy_reward=10)
+    env = gym.make('Hopper-v5', ctrl_cost_weight=1e-3)
     max_action = float(env.action_space.high[0])
 
     if config.checkpoints_path is not None:
@@ -880,7 +945,7 @@ def train(config: TrainConfig):
 
     # Set seeds
     seed = config.seed
-    set_seed(seed, env)
+    # set_seed(seed, env)
 
     critic_1 = FullyConnectedQFunction(
         state_dim,
@@ -934,7 +999,7 @@ def train(config: TrainConfig):
     }
 
     print("---------------------------------------")
-    print(f"Training CQL, Env: {config.env}, Seed: {seed}")
+    print(f"Training CQL, Env: {config.env}, Seed is {seed}")
     print("---------------------------------------")
 
     # Initialize actor
@@ -945,14 +1010,14 @@ def train(config: TrainConfig):
         trainer.load_state_dict(torch.load(policy_file))
         actor = trainer.actor
 
-    wandb_init(asdict(config))
+    # wandb_init(asdict(config))
 
     evaluations = []
     for t in range(int(config.max_timesteps)):
         batch = replay_buffer.sample(config.batch_size)
         batch = [b.to(config.device) for b in batch]
         log_dict = trainer.train(batch)
-        wandb.log(log_dict, step=trainer.total_it)
+        # wandb.log(log_dict, step=trainer.total_it)
         # Evaluate episode
         if (t + 1) % config.eval_freq == 0:
             print(f"Time steps: {t + 1}")
@@ -964,12 +1029,12 @@ def train(config: TrainConfig):
                 seed=config.seed,
             )
             eval_score = eval_scores.mean()
-            normalized_eval_score = env.get_normalized_score(eval_score) * 100.0
-            evaluations.append(normalized_eval_score)
+            # normalized_eval_score = env.get_normalized_score(eval_score) * 100.0
+            evaluations.append(eval_score)
             print("---------------------------------------")
             print(
                 f"Evaluation over {config.n_episodes} episodes: "
-                f"{eval_score:.3f} , D4RL score: {normalized_eval_score:.3f}"
+                f"{eval_score:.3f} , Minari score mean: {eval_score:.3f}"
             )
             print("---------------------------------------")
             if config.checkpoints_path:
@@ -977,11 +1042,11 @@ def train(config: TrainConfig):
                     trainer.state_dict(),
                     os.path.join(config.checkpoints_path, f"checkpoint_{t}.pt"),
                 )
-            wandb.log(
-                {"d4rl_normalized_score": normalized_eval_score},
-                step=trainer.total_it,
-            )
-
+            # wandb.log(
+            #     {"d4rl_normalized_score": normalized_eval_score},
+            #     step=trainer.total_it,
+            # )
+ 
 
 if __name__ == "__main__":
     train()
