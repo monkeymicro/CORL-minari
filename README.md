@@ -2,4 +2,4 @@
 
 Fork from [CORL](https://github.com/tinkoff-ai/CORL), and add [minari](https://github.com/Farama-Foundation/Minari) support.
 
-Test on ubuntu24.04 + python3.10 + pytorch2.8+cuda12.6 + minari0.5.3 + gymnasium 1.2.0
+Tested on Ubuntu 24.04, Python 3.10, PyTorch 2.8 (with CUDA 12.6), Minari 0.5.3, and Gymnasium 1.2.0.
