@@ -1,5 +1,6 @@
 # source: https://github.com/sfujim/TD3_BC
 # https://arxiv.org/pdf/2106.06860.pdf
+
 import copy
 import os
 import random
@@ -16,6 +17,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import wandb
+from tqdm import trange
+
 
 TensorBatch = List[torch.Tensor]
 
@@ -36,18 +39,13 @@ class TrainConfig:
     batch_size: int = 256  # Batch size for all networks
     discount: float = 0.99  # Discount ffor
     expl_noise: float = 0.1  # Std of Gaussian exploration noise
-    tau: float = 0.005  # Target network update rate
-    policy_noise: float = 0.2  # Noise added to target actor during critic update
+    policy_noise: float = 0.2  # Noise added to target actor
     noise_clip: float = 0.5  # Range to clip target actor noise
-    policy_freq: int = 2  # Frequency of delayed actor updates
+    policy_freq: int = 2  # Frequency of delayed policy updates
     # TD3 + BC
-    alpha: float = 2.5  # Coefficient for Q function in actor loss
-    normalize: bool = True  # Normalize states
-    normalize_reward: bool = False  # Normalize reward
-    # Wandb logging
-    project: str = "CORL"
-    group: str = "TD3_BC-MINARI"
-    name: str = "TD3_BC"
+    alpha: float = 2.5  # BC constraint
+    normalize: bool = False
+    normalize_reward: bool = False
 
     def __post_init__(self):
         self.name = f"{self.name}-{self.env}-{str(uuid.uuid4())[:8]}"
@@ -55,12 +53,16 @@ class TrainConfig:
             self.checkpoints_path = os.path.join(self.checkpoints_path, self.name)
 
 
-def soft_update(target: nn.Module, source: nn.Module, tau: float):
-    for target_param, source_param in zip(target.parameters(), source.parameters()):
-        target_param.data.copy_((1 - tau) * target_param.data + tau * source_param.data)
+def set_seed(seed: int, env: Optional[gym.Env] = None):
+    if env is not None:
+        env.action_space.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.manual_seed(seed)
 
 
-def compute_mean_std(states: np.ndarray, eps: float) -> Tuple[np.ndarray, np.ndarray]:
+def compute_mean_std(states: np.ndarray, eps: float = 1e-3) -> Tuple[np.ndarray, np.ndarray]:
     mean = states.mean(0)
     std = states.std(0) + eps
     return mean, std
@@ -70,57 +72,27 @@ def normalize_states(states: np.ndarray, mean: np.ndarray, std: np.ndarray):
     return (states - mean) / std
 
 
-def wrap_env(
-    env: gym.Env,
-    state_mean: Union[np.ndarray, float] = 0.0,
-    state_std: Union[np.ndarray, float] = 1.0,
-    reward_scale: float = 1.0,
-) -> gym.Env:
-    # PEP 8: E731 do not assign a lambda expression, use a def
-    def normalize_state(state):
-        return (
-            state - state_mean
-        ) / state_std  # epsilon should be already added in std.
-
-    def scale_reward(reward):
-        # Please be careful, here reward is multiplied by scale!
-        return reward_scale * reward
-
-    env = gym.wrappers.TransformObservation(env, normalize_state)
-    if reward_scale != 1.0:
-        env = gym.wrappers.TransformReward(env, scale_reward)
-    return env
-
-
 class ReplayBuffer:
     def __init__(
-        self,
-        state_dim: int,
-        action_dim: int,
-        buffer_size: int,
-        device: str = "cpu",
+        self, state_dim: int, action_dim: int, buffer_size: int, normalize_reward: bool = False
     ):
         self._buffer_size = buffer_size
         self._pointer = 0
         self._size = 0
+        self._normalize_reward = normalize_reward
 
-        self._states = torch.zeros(
-            (buffer_size, state_dim), dtype=torch.float32, device=device
+        self.states = np.zeros(
+            (buffer_size, state_dim), dtype=np.float32
         )
-        self._actions = torch.zeros(
-            (buffer_size, action_dim), dtype=torch.float32, device=device
+        self.actions = np.zeros(
+            (buffer_size, action_dim), dtype=np.float32
         )
-        self._rewards = torch.zeros((buffer_size, 1), dtype=torch.float32, device=device)
-        self._next_states = torch.zeros(
-            (buffer_size, state_dim), dtype=torch.float32, device=device
+        self.rewards = np.zeros((buffer_size, 1), dtype=np.float32)
+        self.next_states = np.zeros(
+            (buffer_size, state_dim), dtype=np.float32
         )
-        self._dones = torch.zeros((buffer_size, 1), dtype=torch.float32, device=device)
-        self._device = device
+        self.dones = np.zeros((buffer_size, 1), dtype=np.float32)
 
-    def _to_tensor(self, data: np.ndarray) -> torch.Tensor:
-        return torch.tensor(data, dtype=torch.float32, device=self._device)
-
-    # Loads data in minari, i.e. from Dict[str, np.array].
     def load_minari_dataset(self, data: Dict[str, np.ndarray]):
         if self._size != 0:
             raise ValueError("Trying to load data into non-empty replay buffer")
@@ -129,171 +101,100 @@ class ReplayBuffer:
             raise ValueError(
                 "Replay buffer is smaller than the dataset you are trying to load!"
             )
-        self._states[:n_transitions] = self._to_tensor(data["observations"])
-        self._actions[:n_transitions] = self._to_tensor(data["actions"])
-        self._rewards[:n_transitions] = self._to_tensor(data["rewards"][..., None])
-        self._next_states[:n_transitions] = self._to_tensor(data["next_observations"])
-        self._dones[:n_transitions] = self._to_tensor(data["terminals"][..., None])
+        self.states[:n_transitions] = data["observations"]
+        self.actions[:n_transitions] = data["actions"]
+        self.rewards[:n_transitions] = data["rewards"][..., None]
+        self.next_states[:n_transitions] = data["next_observations"]
+        self.dones[:n_transitions] = data["terminals"][..., None]
         self._size += n_transitions
         self._pointer = min(self._size, n_transitions)
+        if self._normalize_reward:
+            self.normalize_rewards()
 
         print(f"Dataset size: {n_transitions}")
 
+    def normalize_rewards(self, eps: float = 1e-3):
+        mean = self.rewards.mean()
+        std = self.rewards.std() + eps
+        self.rewards = (self.rewards - mean) / std
+
     def sample(self, batch_size: int) -> TensorBatch:
         indices = np.random.randint(0, min(self._size, self._pointer), size=batch_size)
-        states = self._states[indices]
-        actions = self._actions[indices]
-        rewards = self._rewards[indices]
-        next_states = self._next_states[indices]
-        dones = self._dones[indices]
+        states = torch.from_numpy(self.states[indices])
+        actions = torch.from_numpy(self.actions[indices])
+        rewards = torch.from_numpy(self.rewards[indices])
+        next_states = torch.from_numpy(self.next_states[indices])
+        dones = torch.from_numpy(self.dones[indices])
         return [states, actions, rewards, next_states, dones]
-
-    def add_transition(self):
-        # Use this method to add new data into the replay buffer during fine-tuning.
-        # I left it unimplemented since now we do not do fine-tuning.
-        raise NotImplementedError
-
-
-def set_seed(
-    seed: int, env: Optional[gym.Env] = None, deterministic_torch: bool = False
-):
-    if env is not None:
-        env.seed(seed)
-        env.action_space.seed(seed)
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    np.random.seed(seed)
-    random.seed(seed)
-    torch.manual_seed(seed)
-    torch.use_deterministic_algorithms(deterministic_torch)
-
-
-def wandb_init(config: dict) -> None:
-    wandb.init(
-        config=config,
-        project=config["project"],
-        group=config["group"],
-        name=config["name"],
-        id=str(uuid.uuid4()),
-    )
-    wandb.run.save()
-
-
-@torch.no_grad()
-def eval_actor(
-    env: gym.Env, actor: nn.Module, device: str, n_episodes: int, seed: int
-) -> np.ndarray:
-    # env.seed(seed)
-    actor.eval()
-    episode_rewards = []
-    for _ in range(n_episodes):
-        state, _ = env.reset(seed=seed)
-        done = False
-        episode_reward = 0.0
-        while not done:
-            action = actor.act(torch.FloatTensor(state), device)
-            # state, reward, done, _ = env.step(action)
-            state, reward, terminated, truncated, _= env.step(action)
-            done = terminated or truncated
-            episode_reward += reward
-        episode_rewards.append(episode_reward)
-
-    actor.train()
-    return np.asarray(episode_rewards)
-
-def return_reward_range(dataset, max_episode_steps):
-    returns, lengths = [], []
-    ep_ret, ep_len = 0.0, 0
-    for r, d in zip(dataset["rewards"], dataset["terminals"]):
-        ep_ret += float(r)
-        ep_len += 1
-        if d or ep_len == max_episode_steps:
-            returns.append(ep_ret)
-            lengths.append(ep_len)
-            ep_ret, ep_len = 0.0, 0
-    lengths.append(ep_len)  # but still keep track of number of steps
-    assert sum(lengths) == len(dataset["rewards"])
-    return min(returns), max(returns)
-
-
-def modify_reward(dataset, env_name, max_episode_steps=1000):
-    if any(s in env_name for s in ("halfcheetah", "hopper", "walker2d")):
-        min_ret, max_ret = return_reward_range(dataset, max_episode_steps)
-        dataset["rewards"] /= max_ret - min_ret
-        dataset["rewards"] *= max_episode_steps
-    elif "antmaze" in env_name:
-        dataset["rewards"] -= 1.0
 
 
 class Actor(nn.Module):
     def __init__(self, state_dim: int, action_dim: int, max_action: float):
         super(Actor, self).__init__()
 
-        self.net = nn.Sequential(
-            nn.Linear(state_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 256),
-            nn.ReLU(),
-            nn.Linear(256, action_dim),
-            nn.Tanh(),
-        )
+        self.l1 = nn.Linear(state_dim, 256)
+        self.l2 = nn.Linear(256, 256)
+        self.l3 = nn.Linear(256, action_dim)
 
         self.max_action = max_action
 
     def forward(self, state: torch.Tensor) -> torch.Tensor:
-        return self.max_action * self.net(state)
-
-    @torch.no_grad()
-    def act(self, state: np.ndarray, device: str = "cpu") -> np.ndarray:
-        state = torch.tensor(state.reshape(1, -1), device=device, dtype=torch.float32)
-        return self(state).cpu().data.numpy().flatten()
+        a = F.relu(self.l1(state))
+        a = F.relu(self.l2(a))
+        return self.max_action * torch.tanh(self.l3(a))
 
 
 class Critic(nn.Module):
     def __init__(self, state_dim: int, action_dim: int):
         super(Critic, self).__init__()
 
-        self.net = nn.Sequential(
-            nn.Linear(state_dim + action_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 256),
-            nn.ReLU(),
-            nn.Linear(256, 1),
-        )
+        # Q1
+        self.l1 = nn.Linear(state_dim + action_dim, 256)
+        self.l2 = nn.Linear(256, 256)
+        self.l3 = nn.Linear(256, 1)
 
-    def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        # Q2
+        self.l4 = nn.Linear(state_dim + action_dim, 256)
+        self.l5 = nn.Linear(256, 256)
+        self.l6 = nn.Linear(256, 1)
+
+    def forward(self, state: torch.Tensor, action: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         sa = torch.cat([state, action], 1)
-        return self.net(sa)
+
+        q1 = F.relu(self.l1(sa))
+        q1 = F.relu(self.l2(q1))
+        q1 = self.l3(q1)
+
+        q2 = F.relu(self.l4(sa))
+        q2 = F.relu(self.l5(q2))
+        q2 = self.l6(q2)
+        return q1, q2
 
 
-class TD3_BC:
+class TD3_BC(object):
     def __init__(
         self,
-        max_action: float,
-        actor: nn.Module,
+        actor: Actor,
+        critic: Critic,
+        discount: float,
+        tau: float,
+        policy_noise: float,
+        noise_clip: float,
+        policy_freq: int,
+        alpha: float,
         actor_optimizer: torch.optim.Optimizer,
-        critic_1: nn.Module,
-        critic_1_optimizer: torch.optim.Optimizer,
-        critic_2: nn.Module,
-        critic_2_optimizer: torch.optim.Optimizer,
-        discount: float = 0.99,
-        tau: float = 0.005,
-        policy_noise: float = 0.2,
-        noise_clip: float = 0.5,
-        policy_freq: int = 2,
-        alpha: float = 2.5,
-        device: str = "cpu",
+        critic_optimizer: torch.optim.Optimizer,
+        device: str,
     ):
         self.actor = actor
+        self.critic = critic
         self.actor_target = copy.deepcopy(actor)
+        self.critic_target = copy.deepcopy(critic)
+        self.actor_target.load_state_dict(self.actor.state_dict())
+        self.critic_target.load_state_dict(self.critic.state_dict())
         self.actor_optimizer = actor_optimizer
-        self.critic_1 = critic_1
-        self.critic_1_target = copy.deepcopy(critic_1)
-        self.critic_1_optimizer = critic_1_optimizer
-        self.critic_2 = critic_2
-        self.critic_2_target = copy.deepcopy(critic_2)
-        self.critic_2_optimizer = critic_2_optimizer
+        self.critic_optimizer = critic_optimizer
 
-        self.max_action = max_action
         self.discount = discount
         self.tau = tau
         self.policy_noise = policy_noise
@@ -301,234 +202,129 @@ class TD3_BC:
         self.policy_freq = policy_freq
         self.alpha = alpha
 
-        self.total_it = 0
         self.device = device
+        self.total_it = 0
 
     def train(self, batch: TensorBatch) -> Dict[str, float]:
-        log_dict = {}
         self.total_it += 1
-
         state, action, reward, next_state, done = batch
-        not_done = 1 - done
-
+        # Update critic
         with torch.no_grad():
-            # Select action according to actor and add clipped noise
-            noise = (torch.randn_like(action) * self.policy_noise).clamp(
-                -self.noise_clip, self.noise_clip
-            )
+            next_action = self.actor_target(next_state)
+            noise = (
+                torch.randn_like(action)
+                * self.policy_noise
+            ).clamp(-self.noise_clip, self.noise_clip)
+            next_action = (next_action + noise).clamp(-1, 1)
+            target_Q1, target_Q2 = self.critic_target(next_state, next_action)
+            target_Q = torch.min(target_Q1, target_Q2)
+            target_Q = reward + done * self.discount * target_Q
 
-            next_action = (self.actor_target(next_state) + noise).clamp(
-                -self.max_action, self.max_action
-            )
-
-            # Compute the target Q value
-            target_q1 = self.critic_1_target(next_state, next_action)
-            target_q2 = self.critic_2_target(next_state, next_action)
-            target_q = torch.min(target_q1, target_q2)
-            target_q = reward + not_done * self.discount * target_q
-
-        # Get current Q estimates
-        current_q1 = self.critic_1(state, action)
-        current_q2 = self.critic_2(state, action)
-
-        # Compute critic loss
-        critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(current_q2, target_q)
-        log_dict["critic_loss"] = critic_loss.item()
-        # Optimize the critic
-        self.critic_1_optimizer.zero_grad()
-        self.critic_2_optimizer.zero_grad()
+        current_Q1, current_Q2 = self.critic(state, action)
+        critic_loss = F.mse_loss(current_Q1, target_Q) + F.mse_loss(current_Q2, target_Q)
+        self.critic_optimizer.zero_grad()
         critic_loss.backward()
-        self.critic_1_optimizer.step()
-        self.critic_2_optimizer.step()
+        self.critic_optimizer.step()
 
-        # Delayed actor updates
+        # Update actor
         if self.total_it % self.policy_freq == 0:
-            # Compute actor loss
             pi = self.actor(state)
-            q = self.critic_1(state, pi)
-            lmbda = self.alpha / q.abs().mean().detach()
-
-            actor_loss = -lmbda * q.mean() + F.mse_loss(pi, action)
-            log_dict["actor_loss"] = actor_loss.item()
-            # Optimize the actor
+            Q = self.critic.l3(self.critic.l2(F.relu(self.critic.l1(torch.cat([state, pi], 1)))))
+            lmbda = self.alpha / Q.abs().mean().detach()
+            actor_loss = -lmbda * Q.mean() + F.mse_loss(pi, action)
             self.actor_optimizer.zero_grad()
             actor_loss.backward()
             self.actor_optimizer.step()
 
-            # Update the frozen target models
-            soft_update(self.critic_1_target, self.critic_1, self.tau)
-            soft_update(self.critic_2_target, self.critic_2, self.tau)
-            soft_update(self.actor_target, self.actor, self.tau)
+            # Update target networks
+            for param, target_param in zip(self.critic.parameters(), self.critic_target.parameters()):
+                target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
 
-        return log_dict
+            for param, target_param in zip(self.actor.parameters(), self.actor_target.parameters()):
+                target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
 
-    def state_dict(self) -> Dict[str, Any]:
         return {
-            "critic_1": self.critic_1.state_dict(),
-            "critic_1_optimizer": self.critic_1_optimizer.state_dict(),
-            "critic_2": self.critic_2.state_dict(),
-            "critic_2_optimizer": self.critic_2_optimizer.state_dict(),
-            "actor": self.actor.state_dict(),
-            "actor_optimizer": self.actor_optimizer.state_dict(),
-            "total_it": self.total_it,
+            "critic_loss": critic_loss.item(),
+            "actor_loss": actor_loss.item(),
         }
 
-    def load_state_dict(self, state_dict: Dict[str, Any]):
-        self.critic_1.load_state_dict(state_dict["critic_1"])
-        self.critic_1_optimizer.load_state_dict(state_dict["critic_1_optimizer"])
-        self.critic_1_target = copy.deepcopy(self.critic_1)
+@torch.no_grad()
+def eval_actor(
+    env: gym.Env,
+    actor: Actor,
+    device: str,
+    n_episodes: int,
+    seed: int,
+    state_mean: Union[np.ndarray, float],
+    state_std: Union[np.ndarray, float],
+) -> np.ndarray:
+    actor.eval()
+    eval_returns = []
+    set_seed(seed, env)
+    for i in range(n_episodes):
+        state, info = env.reset(seed=seed + 100)
+        state_normalized = (state - state_mean) / state_std
+        done = False
+        total_reward = 0.0
+        while not done:
+            state_normalized_tensor = torch.from_numpy(state_normalized).float().to(device)
+            action = actor(state_normalized_tensor).cpu().numpy()
+            next_state, reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
+            total_reward += reward
+            state = next_state
+            state_normalized = (state - state_mean) / state_std
 
-        self.critic_2.load_state_dict(state_dict["critic_2"])
-        self.critic_2_optimizer.load_state_dict(state_dict["critic_2_optimizer"])
-        self.critic_2_target = copy.deepcopy(self.critic_2)
+        eval_returns.append(total_reward)
 
-        self.actor.load_state_dict(state_dict["actor"])
-        self.actor_optimizer.load_state_dict(state_dict["actor_optimizer"])
-        self.actor_target = copy.deepcopy(self.actor)
-
-        self.total_it = state_dict["total_it"]
-
-
-# 假设你已有的 ReplayBuffer 类如下（简化）：
-class SimpleReplayBuffer:
-    def __init__(self, obs_dim: int, action_dim: int, size: int,):
-        self._states = np.zeros([size, obs_dim], dtype=np.float32)
-        self._actions = np.zeros([size, action_dim], dtype=np.float32)
-        self._rewards = np.zeros([size], dtype=np.float32)
-        self._next_states = np.zeros([size, obs_dim], dtype=np.float32)
-        self._dones = np.zeros([size], dtype=np.float32)
-        self.max_size = size
-        self.ptr, self.size, = 0, 0
-    def store(self, obs: np.ndarray,
-        act: np.ndarray, 
-        rew: float, 
-        next_obs: np.ndarray, 
-        done: float,):
-
-        self._states[self.ptr] = obs
-        self._next_states[self.ptr] = next_obs
-        self._actions[self.ptr] = act
-        self._rewards[self.ptr] = rew
-        self._dones[self.ptr] = done
-        self.ptr = (self.ptr + 1) % self.max_size
-        self.size = min(self.size + 1, self.max_size)
-        # print(f"Loaded {len(data['observations'])} transitions.")
-
+    actor.train()
+    return np.asarray(eval_returns)
 
 @pyrallis.wrap()
 def train(config: TrainConfig):
-    # env = gym.make(config.env)
+    set_seed(config.seed)
+    eval_env = gym.make(config.env)
 
-    # state_dim = env.observation_space.shape[0]
-    # action_dim = env.action_space.shape[0]
+    dataset = minari.load_dataset(config.env, download=True, force_download=False)
 
-    # dataset = d4rl.qlearning_dataset(env)
+    state_dim = dataset.observations.shape[1]
+    action_dim = dataset.actions.shape[1]
 
-    # if config.normalize_reward:
-    #     modify_reward(dataset, config.env)
-
-    # if config.normalize:
-    #     state_mean, state_std = compute_mean_std(dataset["observations"], eps=1e-3)
-    # else:
-    #     state_mean, state_std = 0, 1
-
-    # dataset["observations"] = normalize_states(
-    #     dataset["observations"], state_mean, state_std
-    # )
-    # dataset["next_observations"] = normalize_states(
-    #     dataset["next_observations"], state_mean, state_std
-    # )
-    # env = wrap_env(env, state_mean=state_mean, state_std=state_std)
-    # replay_buffer = ReplayBuffer(
-    #     state_dim,
-    #     action_dim,
-    #     config.buffer_size,
-    #     config.device,
-    # )
-    # replay_buffer.load_d4rl_dataset(dataset)
-
-    # max_action = float(env.action_space.high[0])
-
-    manari_dataset = minari.load_dataset(config.env)
-    print('minari dataset len is :', manari_dataset.total_steps)
-    # 获取维度信息
-    state_dim = manari_dataset.observation_space.shape[0]
-    action_dim = manari_dataset.action_space.shape[0]
-
-    # 创建你的 ReplayBuffer
-    buffer = SimpleReplayBuffer(state_dim, action_dim, manari_dataset.total_steps)
-
-    # 使用 iterate_episodes 来提取数据
-    for ep in manari_dataset.iterate_episodes():
-        for i in range(ep.observations.shape[0] - 1):
-            obs = ep.observations[i]
-            # print(obs)
-            next_obs = ep.observations[i+1]
-            action = ep.actions[i]
-            reward = ep.rewards[i]
-            done = (ep.terminations | ep.truncations)[i].astype(np.float32)
-
-            buffer.store(obs, action, reward, next_obs, done)
-
-    print("Replay buffer filled.")
-    
-    dataset = {
-            "observations": buffer._states,
-            "actions": buffer._actions,
-            "rewards": buffer._rewards,
-            "next_observations": buffer._next_states,
-            "terminals": buffer._dones,
-        }
+    if config.normalize:
+        state_mean, state_std = compute_mean_std(dataset.observations, eps=1e-3)
+    else:
+        state_mean, state_std = 0.0, 1.0
 
     replay_buffer = ReplayBuffer(
         state_dim,
         action_dim,
-        manari_dataset.total_steps,
-        config.device,
+        config.buffer_size,
+        normalize_reward=config.normalize_reward,
     )
     replay_buffer.load_minari_dataset(dataset)
-    env = gym.make('Hopper-v5', ctrl_cost_weight=1e-3)
-    max_action = float(env.action_space.high[0])
 
-    if config.checkpoints_path is not None:
-        print(f"Checkpoints path: {config.checkpoints_path}")
-        os.makedirs(config.checkpoints_path, exist_ok=True)
-        with open(os.path.join(config.checkpoints_path, "config.yaml"), "w") as f:
-            pyrallis.dump(config, f)
-
-    # Set seeds
-    seed = config.seed
-    # set_seed(seed, env)
-
-    actor = Actor(state_dim, action_dim, max_action).to(config.device)
+    # Initialize TD3_BC
+    actor = Actor(state_dim, action_dim, config.max_action).to(config.device)
+    critic = Critic(state_dim, action_dim).to(config.device)
     actor_optimizer = torch.optim.Adam(actor.parameters(), lr=3e-4)
-
-    critic_1 = Critic(state_dim, action_dim).to(config.device)
-    critic_1_optimizer = torch.optim.Adam(critic_1.parameters(), lr=3e-4)
-    critic_2 = Critic(state_dim, action_dim).to(config.device)
-    critic_2_optimizer = torch.optim.Adam(critic_2.parameters(), lr=3e-4)
+    critic_optimizer = torch.optim.Adam(critic.parameters(), lr=3e-4)
 
     kwargs = {
-        "max_action": max_action,
         "actor": actor,
+        "critic": critic,
         "actor_optimizer": actor_optimizer,
-        "critic_1": critic_1,
-        "critic_1_optimizer": critic_1_optimizer,
-        "critic_2": critic_2,
-        "critic_2_optimizer": critic_2_optimizer,
+        "critic_optimizer": critic_optimizer,
         "discount": config.discount,
         "tau": config.tau,
-        "device": config.device,
-        # TD3
-        "policy_noise": config.policy_noise * max_action,
-        "noise_clip": config.noise_clip * max_action,
+        "policy_noise": config.policy_noise,
+        "noise_clip": config.noise_clip,
         "policy_freq": config.policy_freq,
-        # TD3 + BC
         "alpha": config.alpha,
+        "device": config.device,
     }
 
     print("---------------------------------------")
-    print(f"Training TD3 + BC, Env: {config.env}, Seed: {seed}")
+    print(f"Training TD3 + BC")
     print("---------------------------------------")
 
     # Initialize actor
@@ -539,31 +335,36 @@ def train(config: TrainConfig):
         trainer.load_state_dict(torch.load(policy_file))
         actor = trainer.actor
 
-    # wandb_init(asdict(config))
-
-    # evaluations = []
-    for t in range(int(config.max_timesteps)):
+    evaluations = []
+    for t in trange(int(config.max_timesteps)):
         batch = replay_buffer.sample(config.batch_size)
+        if config.normalize:
+            states, actions, rewards, next_states, dones = batch
+            states_normalized = normalize_states(states.cpu().numpy(), state_mean, state_std)
+            next_states_normalized = normalize_states(next_states.cpu().numpy(), state_mean, state_std)
+            states = torch.from_numpy(states_normalized).to(config.device)
+            next_states = torch.from_numpy(next_states_normalized).to(config.device)
+            batch = [states, actions, rewards, next_states, dones]
+
         batch = [b.to(config.device) for b in batch]
         log_dict = trainer.train(batch)
-        # wandb.log(log_dict, step=trainer.total_it)
+
         # Evaluate episode
         if (t + 1) % config.eval_freq == 0:
-            print(f"Time steps: {t + 1}")
             eval_scores = eval_actor(
-                env,
+                eval_env,
                 actor,
                 device=config.device,
                 n_episodes=config.n_episodes,
                 seed=config.seed,
+                state_mean=state_mean,
+                state_std=state_std,
             )
             eval_score = eval_scores.mean()
-            # normalized_eval_score = env.get_normalized_score(eval_score) * 100.0
-            # evaluations.append(normalized_eval_score)
             print("---------------------------------------")
             print(
                 f"Evaluation over {config.n_episodes} episodes: "
-                f"{eval_score:.3f} , D4RL score: {eval_score:.3f}"
+                f"{eval_score:.3f} , Minari score mean: {eval_score:.3f}"
             )
             print("---------------------------------------")
 
@@ -572,12 +373,6 @@ def train(config: TrainConfig):
                     trainer.state_dict(),
                     os.path.join(config.checkpoints_path, f"checkpoint_{t}.pt"),
                 )
-
-            # wandb.log(
-            #     {"d4rl_normalized_score": normalized_eval_score},
-            #     step=trainer.total_it,
-            # )
-
 
 if __name__ == "__main__":
     train()

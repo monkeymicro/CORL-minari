@@ -46,777 +46,501 @@ class Config:
     tau: float = 5e-3
     actor_bc_coef: float = 1.0
     critic_bc_coef: float = 1.0
-    actor_ln: bool = False
-    critic_ln: bool = True
-    policy_noise: float = 0.2
-    noise_clip: float = 0.5
-    policy_freq: int = 2
-    normalize_q: bool = True
     # training params
-    dataset_name: str = 'mujoco/hopper/expert-v0'
-    batch_size: int = 1024
+    buffer_size: int = 1_000_000
+    env_name: str = "mujoco/hopper/expert-v0"
+    batch_size: int = 256
     num_epochs: int = 1000
-    num_updates_on_epoch: int = 1000
-    normalize_reward: bool = False
-    normalize_states: bool = False
+    num_updates_on_epoch: int = 500
+    normalize: bool = False # Normalize states
+    normalize_reward: bool = False # Normalize reward
     # evaluation params
     eval_episodes: int = 10
     eval_every: int = 5
     # general params
-    train_seed: int = 0
+    checkpoints_path: Optional[str] = None
+    deterministic_jax: bool = False
+    train_seed: int = 10
     eval_seed: int = 42
 
     def __post_init__(self):
-        self.name = f"{self.name}-{self.dataset_name}-{str(uuid.uuid4())[:8]}"
+        self.name = f"{self.name}-{self.env_name}-{str(uuid.uuid4())[:8]}"
+        if self.checkpoints_path is not None:
+            self.checkpoints_path = os.path.join(self.checkpoints_path, self.name)
 
 
-def pytorch_init(fan_in: float) -> Callable:
-    """
-    Default init for PyTorch Linear layer weights and biases:
-    https://pytorch.org/docs/stable/generated/torch.nn.Linear.html
-    """
-    bound = math.sqrt(1 / fan_in)
-
-    def _init(key: jax.random.PRNGKey, shape: Tuple, dtype: type) -> jax.Array:
-        return jax.random.uniform(
-            key, shape=shape, minval=-bound, maxval=bound, dtype=dtype
-        )
-
-    return _init
-
-
-def uniform_init(bound: float) -> Callable:
-    def _init(key: jax.random.PRNGKey, shape: Tuple, dtype: type) -> jax.Array:
-        return jax.random.uniform(
-            key, shape=shape, minval=-bound, maxval=bound, dtype=dtype
-        )
-
-    return _init
-
-
-def identity(x: Any) -> Any:
-    return x
-
-
-class DetActor(nn.Module):
-    action_dim: int
-    hidden_dim: int = 256
-    layernorm: bool = True
-    n_hiddens: int = 3
-
-    @nn.compact
-    def __call__(self, state: jax.Array) -> jax.Array:
-        s_d, h_d = state.shape[-1], self.hidden_dim
-        # Initialization as in the EDAC paper
-        layers = [
-            nn.Dense(
-                self.hidden_dim,
-                kernel_init=pytorch_init(s_d),
-                bias_init=nn.initializers.constant(0.1),
-            ),
-            nn.relu,
-            nn.LayerNorm() if self.layernorm else identity,
-        ]
-        for _ in range(self.n_hiddens - 1):
-            layers += [
-                nn.Dense(
-                    self.hidden_dim,
-                    kernel_init=pytorch_init(h_d),
-                    bias_init=nn.initializers.constant(0.1),
-                ),
-                nn.relu,
-                nn.LayerNorm() if self.layernorm else identity,
-            ]
-        layers += [
-            nn.Dense(
-                self.action_dim,
-                kernel_init=uniform_init(1e-3),
-                bias_init=uniform_init(1e-3),
-            ),
-            nn.tanh,
-        ]
-        net = nn.Sequential(layers)
-        actions = net(state)
-        return actions
-
-
-class Critic(nn.Module):
-    hidden_dim: int = 256
-    layernorm: bool = True
-    n_hiddens: int = 3
-
-    @nn.compact
-    def __call__(self, state: jax.Array, action: jax.Array) -> jax.Array:
-        s_d, a_d, h_d = state.shape[-1], action.shape[-1], self.hidden_dim
-        # Initialization as in the EDAC paper
-        layers = [
-            nn.Dense(
-                self.hidden_dim,
-                kernel_init=pytorch_init(s_d + a_d),
-                bias_init=nn.initializers.constant(0.1),
-            ),
-            nn.relu,
-            nn.LayerNorm() if self.layernorm else identity,
-        ]
-        for _ in range(self.n_hiddens - 1):
-            layers += [
-                nn.Dense(
-                    self.hidden_dim,
-                    kernel_init=pytorch_init(h_d),
-                    bias_init=nn.initializers.constant(0.1),
-                ),
-                nn.relu,
-                nn.LayerNorm() if self.layernorm else identity,
-            ]
-        layers += [
-            nn.Dense(1, kernel_init=uniform_init(3e-3), bias_init=uniform_init(3e-3))
-        ]
-        network = nn.Sequential(layers)
-        state_action = jnp.hstack([state, action])
-        out = network(state_action).squeeze(-1)
-        return out
-
-
-class EnsembleCritic(nn.Module):
-    hidden_dim: int = 256
-    num_critics: int = 10
-    layernorm: bool = True
-    n_hiddens: int = 3
-
-    @nn.compact
-    def __call__(self, state: jax.Array, action: jax.Array) -> jax.Array:
-        ensemble = nn.vmap(
-            target=Critic,
-            in_axes=None,
-            out_axes=0,
-            variable_axes={"params": 0},
-            split_rngs={"params": True},
-            axis_size=self.num_critics,
-        )
-        q_values = ensemble(self.hidden_dim, self.layernorm, self.n_hiddens)(
-            state, action
-        )
-        return q_values
-
-
-def qlearning_dataset(
-    env: gym.Env,
-    dataset: Dict = None,
-    terminate_on_end: bool = False,
-    **kwargs,
-) -> Dict:
-    if dataset is None:
-        dataset = env.get_dataset(**kwargs)
-
-    N = dataset["rewards"].shape[0]
-    obs_ = []
-    next_obs_ = []
-    action_ = []
-    next_action_ = []
-    reward_ = []
-    done_ = []
-
-    # The newer version of the dataset adds an explicit
-    # timeouts field. Keep old method for backwards compatability.
-    use_timeouts = "timeouts" in dataset
-
-    episode_step = 0
-    for i in range(N - 1):
-        obs = dataset["observations"][i].astype(np.float32)
-        new_obs = dataset["observations"][i + 1].astype(np.float32)
-        action = dataset["actions"][i].astype(np.float32)
-        new_action = dataset["actions"][i + 1].astype(np.float32)
-        reward = dataset["rewards"][i].astype(np.float32)
-        done_bool = bool(dataset["terminals"][i])
-
-        if use_timeouts:
-            final_timestep = dataset["timeouts"][i]
-        else:
-            final_timestep = episode_step == env._max_episode_steps - 1
-        if (not terminate_on_end) and final_timestep:
-            # Skip this transition
-            episode_step = 0
-            continue
-        if done_bool or final_timestep:
-            episode_step = 0
-
-        obs_.append(obs)
-        next_obs_.append(new_obs)
-        action_.append(action)
-        next_action_.append(new_action)
-        reward_.append(reward)
-        done_.append(done_bool)
-        episode_step += 1
-
-    return {
-        "observations": np.array(obs_),
-        "actions": np.array(action_),
-        "next_observations": np.array(next_obs_),
-        "next_actions": np.array(next_action_),
-        "rewards": np.array(reward_),
-        "terminals": np.array(done_),
-    }
-
-
-def compute_mean_std(states: jax.Array, eps: float) -> Tuple[jax.Array, jax.Array]:
+def compute_mean_std(states: np.ndarray, eps: float = 1e-3) -> Tuple[np.ndarray, np.ndarray]:
     mean = states.mean(0)
     std = states.std(0) + eps
     return mean, std
 
-
-def normalize_states(states: jax.Array, mean: jax.Array, std: jax.Array) -> jax.Array:
+def normalize_states(states: np.ndarray, mean: np.ndarray, std: np.ndarray):
     return (states - mean) / std
 
-# 假设你已有的 ReplayBuffer 类如下（简化）：
-class SimpleReplayBuffer:
-    def __init__(self, obs_dim: int, action_dim: int, size: int,):
-        self._states = np.zeros([size, obs_dim], dtype=np.float32)
-        self._actions = np.zeros([size, action_dim], dtype=np.float32)
-        self._rewards = np.zeros([size], dtype=np.float32)
-        self._next_states = np.zeros([size, obs_dim], dtype=np.float32)
-        self._dones = np.zeros([size], dtype=np.float32)
-        self._next_actions = np.zeros([size, action_dim], dtype=np.float32)
-        self.max_size = size
-        self.ptr, self.size, = 0, 0
-    def store(self, obs: np.ndarray,
-        act: np.ndarray, 
-        rew: float, 
-        next_obs: np.ndarray, 
-        done: float,
-        next_act: np.ndarray):
 
-        self._states[self.ptr] = obs
-        self._next_states[self.ptr] = next_obs
-        self._actions[self.ptr] = act
-        self._rewards[self.ptr] = rew
-        self._dones[self.ptr] = done
-        self._next_actions[self.ptr] = next_act
-        self.ptr = (self.ptr + 1) % self.max_size
-        self.size = min(self.size + 1, self.max_size)
-        # print(f"Loaded {len(data['observations'])} transitions.")
-
-@chex.dataclass
 class ReplayBuffer:
-    data: Dict[str, jax.Array] = None
-    mean: float = 0
-    std: float = 1
-
-    def create_from_minari(
+    def __init__(
         self,
-        dataset_name: str,
-        normalize_reward: bool = False,
-        is_normalize: bool = False,
+        state_dim: int,
+        action_dim: int,
+        buffer_size: int,
+        normalize_reward: bool = False
     ):
-        manari_dataset = minari.load_dataset(dataset_name)
-        print('minari dataset len is :', manari_dataset.total_steps)
-        # 获取维度信息
-        state_dim = manari_dataset.observation_space.shape[0]
-        action_dim = manari_dataset.action_space.shape[0]
-
-        # 创建你的 ReplayBuffer
-        buffer = SimpleReplayBuffer(state_dim, action_dim, manari_dataset.total_steps)
-
-        # 使用 iterate_episodes 来提取数据
-        for ep in manari_dataset.iterate_episodes():
-            for i in range(ep.observations.shape[0] - 2):
-                obs = ep.observations[i]
-                # print(obs)
-                next_obs = ep.observations[i+1]
-                action = ep.actions[i]
-                next_action = ep.actions[i+1]
-                reward = ep.rewards[i]
-                done = (ep.terminations | ep.truncations)[i].astype(np.float32)
-
-                buffer.store(obs, action, reward, next_obs, done, next_action)
-
-        print("Replay buffer filled.")
+        self._buffer_size = buffer_size
+        self._pointer = 0
+        self._size = 0
         
-        dataset = {
-                "observations": buffer._states,
-                "actions": buffer._actions,
-                "next_actions": buffer._next_actions,
-                "rewards": buffer._rewards,
-                "next_observations": buffer._next_states,
-                "terminals": buffer._dones,
-        }
-        buffer = {
-            "states": jnp.asarray(dataset["observations"], dtype=jnp.float32),
-            "actions": jnp.asarray(dataset["actions"], dtype=jnp.float32),
-            "rewards": jnp.asarray(dataset["rewards"], dtype=jnp.float32),
-            "next_states": jnp.asarray(
-                dataset["next_observations"], dtype=jnp.float32
-            ),
-            "next_actions": jnp.asarray(dataset["next_actions"], dtype=jnp.float32),
-            "dones": jnp.asarray(dataset["terminals"], dtype=jnp.float32),
-        }
-        if is_normalize:
-            self.mean, self.std = compute_mean_std(buffer["states"], eps=1e-3)
-            buffer["states"] = normalize_states(buffer["states"], self.mean, self.std)
-            buffer["next_states"] = normalize_states(
-                buffer["next_states"], self.mean, self.std
-            )
-        if normalize_reward:
-            buffer["rewards"] = ReplayBuffer.normalize_reward(
-                dataset_name, buffer["rewards"]
-            )
-        self.data = buffer
-
-    @property
-    def size(self) -> int:
-        # WARN: It will use len of the dataclass, i.e. number of fields.
-        return self.data["states"].shape[0]
-
-    def sample_batch(
-        self, key: jax.random.PRNGKey, batch_size: int
-    ) -> Dict[str, jax.Array]:
-        indices = jax.random.randint(
-            key, shape=(batch_size,), minval=0, maxval=self.size
+        self.states = np.zeros(
+            (buffer_size, state_dim), dtype=np.float32
         )
-        batch = jax.tree_map(lambda arr: arr[indices], self.data)
-        return batch
+        self.actions = np.zeros(
+            (buffer_size, action_dim), dtype=np.float32
+        )
+        self.rewards = np.zeros((buffer_size, 1), dtype=np.float32)
+        self.next_states = np.zeros(
+            (buffer_size, state_dim), dtype=np.float32
+        )
+        self.dones = np.zeros((buffer_size, 1), dtype=np.float32)
 
-    def get_moments(self, modality: str) -> Tuple[jax.Array, jax.Array]:
-        mean = self.data[modality].mean(0)
-        std = self.data[modality].std(0)
-        return mean, std
+        self._normalize_reward = normalize_reward
 
-    @staticmethod
-    def normalize_reward(dataset_name: str, rewards: jax.Array) -> jax.Array:
-        if "antmaze" in dataset_name:
-            return rewards * 100.0  # like in LAPO
-        else:
-            raise NotImplementedError(
-                "Reward normalization is implemented only for AntMaze yet!"
+    # Loads data in minari, i.e. from Dict[str, np.array].
+    def load_minari_dataset(self, data: Dict[str, np.ndarray]):
+        if self._size != 0:
+            raise ValueError("Trying to load data into non-empty replay buffer")
+        n_transitions = data["observations"].shape[0]
+        if n_transitions > self._buffer_size:
+            raise ValueError(
+                "Replay buffer is smaller than the dataset you are trying to load!"
+            )
+        self.states[:n_transitions] = data["observations"]
+        self.actions[:n_transitions] = data["actions"]
+        self.rewards[:n_transitions] = data["rewards"][..., None]
+        self.next_states[:n_transitions] = data["next_observations"]
+        self.dones[:n_transitions] = data["terminals"][..., None]
+        self._size += n_transitions
+        self._pointer = min(self._size, n_transitions)
+
+        if self._normalize_reward:
+            self.normalize_rewards()
+
+        print(f"Dataset size: {n_transitions}")
+
+    def normalize_rewards(self, eps: float = 1e-3) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Computes mean and std of rewards and normalizes them.
+        """
+        reward_mean = self.rewards.mean(axis=0)
+        reward_std = self.rewards.std(axis=0) + eps
+        self.rewards = (self.rewards - reward_mean) / reward_std
+        return reward_mean, reward_std
+
+    def sample(self, batch_size: int) -> Tuple[jnp.ndarray]:
+        indices = np.random.randint(0, min(self._size, self._pointer), size=batch_size)
+        return (
+            jnp.asarray(self.states[indices]),
+            jnp.asarray(self.actions[indices]),
+            jnp.asarray(self.rewards[indices]),
+            jnp.asarray(self.next_states[indices]),
+            jnp.asarray(self.dones[indices]),
+        )
+
+
+class MLP(nn.Module):
+    hidden_dim: int
+    n_hiddens: int
+    output_dim: int
+    layernorm: bool = False
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        for i in range(self.n_hiddens):
+            x = nn.Dense(
+                self.hidden_dim,
+                kernel_init=default_kernel_init,
+                bias_init=default_bias_init,
+            )(x)
+            if self.layernorm:
+                x = nn.LayerNorm()(x)
+            x = nn.relu(x)
+        x = nn.Dense(self.output_dim, kernel_init=default_kernel_init)(x)
+        return x
+
+
+class Actor(nn.Module):
+    hidden_dim: int
+    n_hiddens: int
+    action_dim: int
+
+    @nn.compact
+    def __call__(
+        self, state: jnp.ndarray, deterministic: bool = False
+    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        trunk = MLP(self.hidden_dim, self.n_hiddens, self.hidden_dim)(state)
+        mu = nn.Dense(
+            self.action_dim, kernel_init=default_kernel_init, bias_init=default_bias_init
+        )(trunk)
+        log_std = nn.Dense(
+            self.action_dim, kernel_init=default_kernel_init, bias_init=default_bias_init
+        )(trunk)
+        log_std = jnp.clip(log_std, -20.0, 2.0)
+        std = jnp.exp(log_std)
+
+        mu = jnp.clip(mu, -20.0, 20.0)
+
+        if deterministic:
+            return jnp.tanh(mu), None
+
+        pi = mu + jax.random.normal(self.make_rng("noise"), shape=mu.shape) * std
+        return jnp.tanh(pi), None
+
+
+class Critic(nn.Module):
+    hidden_dim: int
+    n_hiddens: int
+    num_critics: int = 1
+
+    @nn.compact
+    def __call__(self, state: jnp.ndarray, action: jnp.ndarray) -> jnp.ndarray:
+        x = jnp.concatenate([state, action], axis=-1)
+        q_values = MLP(
+            hidden_dim=self.hidden_dim,
+            n_hiddens=self.n_hiddens,
+            output_dim=self.num_critics,
+        )(x)
+        return q_values
+
+
+class ReBRAC:
+    def __init__(self, rng: chex.PRNGKey, config: Config):
+        self.config = config
+        self.rng = rng
+
+        self.dummy_state = jnp.zeros((1, 1), dtype=jnp.float32)
+        self.dummy_action = jnp.zeros((1, 1), dtype=jnp.float32)
+
+        self.actor = Actor(
+            self.config.hidden_dim, self.config.actor_n_hiddens, 1
+        )
+        self.actor_state = TrainState.create(
+            apply_fn=self.actor.apply,
+            params=self.actor.init(
+                {"params": self.rng, "noise": self.rng}, self.dummy_state
+            )["params"],
+            tx=optax.adam(self.config.actor_learning_rate),
+        )
+
+        self.critic = Critic(self.config.hidden_dim, self.config.critic_n_hiddens, 1)
+        self.critic_state = TrainState.create(
+            apply_fn=self.critic.apply,
+            params=self.critic.init(self.rng, self.dummy_state, self.dummy_action)[
+                "params"
+            ],
+            tx=optax.adam(self.config.critic_learning_rate),
+        )
+        self.target_critic_params = deepcopy(self.critic_state.params)
+
+        self.log_alpha = chex.Array(0.0)
+        self.log_alpha_optimizer = optax.adam(self.config.actor_learning_rate)
+        self.log_alpha_state = self.log_alpha_optimizer.init(self.log_alpha)
+
+        self.target_entropy = -1
+
+    def update(
+        self,
+        rng: chex.PRNGKey,
+        actor_state: TrainState,
+        critic_state: TrainState,
+        target_critic_params: FrozenDict,
+        log_alpha_state: optax.OptState,
+        log_alpha: chex.Array,
+        batch: Dict[str, jnp.ndarray],
+    ):
+        rng, actor_key, critic_key = jax.random.split(rng, 3)
+
+        def loss_alpha_fn(log_alpha_frozen: chex.Array, a_key: chex.PRNGKey):
+            """
+            Alpha loss is independent of critic.
+            """
+            mu, _ = self.actor.apply(
+                {"params": actor_state.params},
+                batch["states"],
+                deterministic=False,
+                rngs={"noise": a_key},
+            )
+            # `actions` above is sampled from a gaussian, while batch["actions"] is taken
+            # from the replay buffer. `log_pi` will be negative since we are taking the
+            # log probability of the sampled action under the new policy distribution
+            log_pi = jnp.log(1 - jnp.tanh(mu) ** 2 + 1e-6)
+            alpha = jnp.exp(log_alpha_frozen)
+            alpha_loss = -alpha * (log_pi + self.target_entropy).mean()
+            return alpha_loss, alpha
+
+        def critic_loss_fn(
+            critic_params: FrozenDict, target_critic_params: FrozenDict
+        ):
+            q_target = self.critic.apply(
+                {"params": target_critic_params},
+                batch["next_states"],
+                batch["actions"],
             )
 
+            q_pred = self.critic.apply(
+                {"params": critic_params}, batch["states"], batch["actions"]
+            )
+            # Using the replay buffer actions
+            # q_target = batch['rewards'] + self.config.gamma * (1-batch['dones'])*q_target
+            # critic_loss = ((q_target - q_pred)**2).mean()
 
-@chex.dataclass(frozen=True)
-class Metrics:
-    accumulators: Dict[str, Tuple[jax.Array, jax.Array]]
+            # Using the replay buffer actions
+            y = (
+                batch["rewards"]
+                + self.config.gamma * (1 - batch["dones"]) * q_target
+            )
+            q_loss = (q_pred - y) ** 2
+            critic_loss = jnp.mean(q_loss)
+            return critic_loss
 
-    @staticmethod
-    def create(metrics: Sequence[str]) -> "Metrics":
-        init_metrics = {key: (jnp.array([0.0]), jnp.array([0.0])) for key in metrics}
-        return Metrics(accumulators=init_metrics)
+        # Using the replay buffer actions for the actor loss
+        def actor_loss_fn(actor_params: FrozenDict, c_key: chex.PRNGKey):
+            q_pred = self.critic.apply(
+                {"params": critic_state.params},
+                batch["states"],
+                batch["actions"],
+            )
+            actor_loss = -(q_pred).mean()
+            return actor_loss
 
-    def update(self, updates: Dict[str, jax.Array]) -> "Metrics":
-        new_accumulators = deepcopy(self.accumulators)
-        for key, value in updates.items():
-            acc, steps = new_accumulators[key]
-            new_accumulators[key] = (acc + value, steps + 1)
+        # alpha update
+        (alpha_loss, alpha), log_alpha_grads = jax.value_and_grad(
+            loss_alpha_fn, has_aux=True
+        )(log_alpha, actor_key)
+        log_alpha_updates, log_alpha_state = self.log_alpha_optimizer.update(
+            log_alpha_grads, log_alpha_state
+        )
+        log_alpha = optax.apply_updates(log_alpha, log_alpha_updates)
 
-        return self.replace(accumulators=new_accumulators)
+        # critic update
+        critic_loss, critic_grads = jax.value_and_grad(critic_loss_fn)(
+            critic_state.params, target_critic_params
+        )
+        critic_state = critic_state.apply_gradients(grads=critic_grads)
+        target_critic_params = optax.incremental_update(
+            critic_state.params, target_critic_params, self.config.tau
+        )
 
-    def compute(self) -> Dict[str, np.ndarray]:
-        # cumulative_value / total_steps
-        return {k: np.array(v[0] / v[1]) for k, v in self.accumulators.items()}
+        # actor update
+        actor_loss, actor_grads = jax.value_and_grad(actor_loss_fn)(
+            actor_state.params, critic_key
+        )
+        actor_state = actor_state.apply_gradients(grads=actor_grads)
 
+        metrics = {
+            "critic_loss": critic_loss,
+            "actor_loss": actor_loss,
+            "alpha_loss": alpha_loss,
+            "alpha": alpha,
+        }
 
-def normalize(
-    arr: jax.Array, mean: jax.Array, std: jax.Array, eps: float = 1e-8
-) -> jax.Array:
-    return (arr - mean) / (std + eps)
-
-
-def make_env(env_name: str, seed: int) -> gym.Env:
-    env = gym.make(env_name)
-    env.seed(seed)
-    env.action_space.seed(seed)
-    env.observation_space.seed(seed)
-    return env
-
-
-def wrap_env(
-    env: gym.Env,
-    state_mean: Union[np.ndarray, float] = 0.0,
-    state_std: Union[np.ndarray, float] = 1.0,
-    reward_scale: float = 1.0,
-) -> gym.Env:
-    # PEP 8: E731 do not assign a lambda expression, use a def
-    def normalize_state(state: np.ndarray) -> np.ndarray:
         return (
-            state - state_mean
-        ) / state_std  # epsilon should be already added in std.
-
-    def scale_reward(reward: float) -> float:
-        # Please be careful, here reward is multiplied by scale!
-        return reward_scale * reward
-
-    env = gym.wrappers.TransformObservation(env, normalize_state)
-    if reward_scale != 1.0:
-        env = gym.wrappers.TransformReward(env, scale_reward)
-    return env
+            rng,
+            actor_state,
+            critic_state,
+            target_critic_params,
+            log_alpha_state,
+            log_alpha,
+            metrics,
+        )
 
 
+@partial(jax.jit, static_argnames=("actor_apply_fn", "n_episodes"))
 def evaluate(
     env: gym.Env,
-    params: jax.Array,
-    action_fn: Callable,
-    num_episodes: int,
+    actor_params: FrozenDict,
+    actor_apply_fn: Callable,
+    n_episodes: int,
     seed: int,
-) -> np.ndarray:
-    # env.seed(seed)
-    env.action_space.seed(seed)
-    env.observation_space.seed(seed)
-
-    returns = []
-    for _ in trange(num_episodes, desc="Eval", leave=False):
-        obs, _ = env.reset(seed=seed)
-        done = False
-        total_reward = 0.0
-        while not done:
-            action = np.asarray(jax.device_get(action_fn(params, obs)))
-            # obs, reward, done, _ = env.step(action)
-            obs, reward, terminated, truncated, _= env.step(action)
-            done = terminated or truncated
-            total_reward += reward
-        returns.append(total_reward)
-
-    return np.array(returns)
-
-
-class CriticTrainState(TrainState):
-    target_params: FrozenDict
-
-
-class ActorTrainState(TrainState):
-    target_params: FrozenDict
-
-
-def update_actor(
-    key: jax.random.PRNGKey,
-    actor: TrainState,
-    critic: TrainState,
-    batch: Dict[str, jax.Array],
-    beta: float,
-    tau: float,
-    normalize_q: bool,
-    metrics: Metrics,
-) -> Tuple[jax.random.PRNGKey, TrainState, TrainState, Metrics]:
-    key, random_action_key = jax.random.split(key, 2)
-
-    def actor_loss_fn(params: jax.Array) -> Tuple[jax.Array, Metrics]:
-        actions = actor.apply_fn(params, batch["states"])
-
-        bc_penalty = ((actions - batch["actions"]) ** 2).sum(-1)
-        q_values = critic.apply_fn(critic.params, batch["states"], actions).min(0)
-        lmbda = 1
-        if normalize_q:
-            lmbda = jax.lax.stop_gradient(1 / jax.numpy.abs(q_values).mean())
-
-        loss = (beta * bc_penalty - lmbda * q_values).mean()
-
-        # logging stuff
-        random_actions = jax.random.uniform(
-            random_action_key, shape=batch["actions"].shape, minval=-1.0, maxval=1.0
+    state_mean: Union[np.ndarray, float],
+    state_std: Union[np.ndarray, float],
+):
+    def step(carry, _):
+        state, key = carry
+        state_normalized = (state - state_mean) / state_std
+        action, _ = actor_apply_fn(
+            {"params": actor_params},
+            state_normalized,
+            deterministic=True,
+            rngs={"noise": key},
         )
-        new_metrics = metrics.update(
-            {
-                "actor_loss": loss,
-                "bc_mse_policy": bc_penalty.mean(),
-                "bc_mse_random": ((random_actions - batch["actions"]) ** 2)
-                .sum(-1)
-                .mean(),
-                "action_mse": ((actions - batch["actions"]) ** 2).mean(),
-            }
+        next_state, reward, terminated, truncated, _ = env.step(np.array(action))
+        done = terminated or truncated
+        return (
+            (next_state, key),
+            (reward, done),
         )
-        return loss, new_metrics
 
-    grads, new_metrics = jax.grad(actor_loss_fn, has_aux=True)(actor.params)
-    new_actor = actor.apply_gradients(grads=grads)
-
-    new_actor = new_actor.replace(
-        target_params=optax.incremental_update(actor.params, actor.target_params, tau)
-    )
-    new_critic = critic.replace(
-        target_params=optax.incremental_update(critic.params, critic.target_params, tau)
+    states, _ = env.reset(seed=seed)
+    keys = jax.random.split(jax.random.PRNGKey(seed), n_episodes)
+    (states, _), (rewards, dones) = jax.lax.scan(
+        step,
+        (states, keys),
+        None,
+        length=env.spec.max_episode_steps,
     )
 
-    return key, new_actor, new_critic, new_metrics
-
-
-def update_critic(
-    key: jax.random.PRNGKey,
-    actor: TrainState,
-    critic: CriticTrainState,
-    batch: Dict[str, jax.Array],
-    gamma: float,
-    beta: float,
-    tau: float,
-    policy_noise: float,
-    noise_clip: float,
-    metrics: Metrics,
-) -> Tuple[jax.random.PRNGKey, TrainState, Metrics]:
-    key, actions_key = jax.random.split(key)
-
-    next_actions = actor.apply_fn(actor.target_params, batch["next_states"])
-    noise = jax.numpy.clip(
-        (jax.random.normal(actions_key, next_actions.shape) * policy_noise),
-        -noise_clip,
-        noise_clip,
-    )
-    next_actions = jax.numpy.clip(next_actions + noise, -1, 1)
-    bc_penalty = ((next_actions - batch["next_actions"]) ** 2).sum(-1)
-    next_q = critic.apply_fn(
-        critic.target_params, batch["next_states"], next_actions
-    ).min(0)
-    next_q = next_q - beta * bc_penalty
-
-    target_q = batch["rewards"] + (1 - batch["dones"]) * gamma * next_q
-
-    def critic_loss_fn(critic_params: jax.Array) -> Tuple[jax.Array, jax.Array]:
-        # [N, batch_size] - [1, batch_size]
-        q = critic.apply_fn(critic_params, batch["states"], batch["actions"])
-        q_min = q.min(0).mean()
-        loss = ((q - target_q[None, ...]) ** 2).mean(1).sum(0)
-        return loss, q_min
-
-    (loss, q_min), grads = jax.value_and_grad(critic_loss_fn, has_aux=True)(
-        critic.params
-    )
-    new_critic = critic.apply_gradients(grads=grads)
-    new_metrics = metrics.update(
-        {
-            "critic_loss": loss,
-            "q_min": q_min,
-        }
-    )
-    return key, new_critic, new_metrics
-
-
-def update_td3(
-    key: jax.random.PRNGKey,
-    actor: TrainState,
-    critic: CriticTrainState,
-    batch: Dict[str, Any],
-    metrics: Metrics,
-    gamma: float,
-    actor_bc_coef: float,
-    critic_bc_coef: float,
-    tau: float,
-    policy_noise: float,
-    noise_clip: float,
-    normalize_q: bool,
-) -> Tuple[jax.random.PRNGKey, TrainState, TrainState, Metrics]:
-    key, new_critic, new_metrics = update_critic(
-        key,
-        actor,
-        critic,
-        batch,
-        gamma,
-        critic_bc_coef,
-        tau,
-        policy_noise,
-        noise_clip,
-        metrics,
-    )
-    key, new_actor, new_critic, new_metrics = update_actor(
-        key, actor, new_critic, batch, actor_bc_coef, tau, normalize_q, new_metrics
-    )
-    return key, new_actor, new_critic, new_metrics
-
-
-def update_td3_no_targets(
-    key: jax.random.PRNGKey,
-    actor: TrainState,
-    critic: CriticTrainState,
-    batch: Dict[str, Any],
-    gamma: float,
-    metrics: Metrics,
-    actor_bc_coef: float,
-    critic_bc_coef: float,
-    tau: float,
-    policy_noise: float,
-    noise_clip: float,
-) -> Tuple[jax.random.PRNGKey, TrainState, TrainState, Metrics]:
-    key, new_critic, new_metrics = update_critic(
-        key,
-        actor,
-        critic,
-        batch,
-        gamma,
-        critic_bc_coef,
-        tau,
-        policy_noise,
-        noise_clip,
-        metrics,
-    )
-    return key, actor, new_critic, new_metrics
-
-
-def action_fn(actor: TrainState) -> Callable:
-    @jax.jit
-    def _action_fn(obs: jax.Array) -> jax.Array:
-        action = actor.apply_fn(actor.params, obs)
-        return action
-
-    return _action_fn
+    return jnp.sum(rewards, axis=0)
 
 
 @pyrallis.wrap()
-def main(config: Config):
-    dict_config = asdict(config)
-    dict_config["mlc_job_name"] = os.environ.get("PLATFORM_JOB_NAME")
+def train(config: Config):
+    if config.deterministic_jax:
+        os.environ["JAX_ENABLE_X64"] = "1"
+        chex.set_determinism(True)
+    rng = jax.random.PRNGKey(config.train_seed)
+    rng, dataset_rng = jax.random.split(rng)
 
-    # wandb.init(
-    #     config=dict_config,
-    #     project=config.project,
-    #     group=config.group,
-    #     name=config.name,
-    #     id=str(uuid.uuid4()),
-    # )
-    # wandb.mark_preempting()
-    buffer = ReplayBuffer()
-    buffer.create_from_minari(
-        config.dataset_name, config.normalize_reward, config.normalize_states
+    eval_env = gym.make(config.env_name)
+
+    dataset = minari.load_dataset(config.env_name, download=True, seed=None)
+
+    state_dim = dataset.observations.shape[1]
+    action_dim = dataset.actions.shape[1]
+
+    if config.normalize:
+        state_mean, state_std = compute_mean_std(dataset.observations, eps=1e-3)
+    else:
+        state_mean, state_std = 0.0, 1.0
+
+    replay_buffer = ReplayBuffer(
+        state_dim,
+        action_dim,
+        config.buffer_size,
+        normalize_reward=config.normalize_reward,
     )
+    replay_buffer.load_minari_dataset(dataset)
 
-    key = jax.random.PRNGKey(seed=config.train_seed)
-    key, actor_key, critic_key = jax.random.split(key, 3)
+    # Initializing ReBRAC agent
+    rng, agent_rng = jax.random.split(rng)
+    agent = ReBRAC(agent_rng, config)
 
-    # eval_env = make_env(config.dataset_name, seed=config.eval_seed)
-    # eval_env = wrap_env(eval_env, buffer.mean, buffer.std)
-    eval_env = gym.make('Hopper-v5', ctrl_cost_weight=1e-3)
+    # Initializing train states
+    actor_state = agent.actor_state
+    critic_state = agent.critic_state
+    target_critic_params = agent.target_critic_params
+    log_alpha_state = agent.log_alpha_state
+    log_alpha = agent.log_alpha
 
-    init_state = buffer.data["states"][0][None, ...]
-    init_action = buffer.data["actions"][0][None, ...]
+    # Jitting the update function
+    update_fn = jax.jit(agent.update)
+    actor_action_fn = jax.jit(agent.actor.apply)
 
-    actor_module = DetActor(
-        action_dim=init_action.shape[-1],
-        hidden_dim=config.hidden_dim,
-        layernorm=config.actor_ln,
-        n_hiddens=config.actor_n_hiddens,
+    if config.checkpoints_path is not None:
+        print(f"Checkpoints path: {config.checkpoints_path}")
+        os.makedirs(config.checkpoints_path, exist_ok=True)
+        with open(os.path.join(config.checkpoints_path, "config.yaml"), "w") as f:
+            pyrallis.dump(config, f)
+
+    wandb.init(
+        config=asdict(config),
+        project=config.project,
+        group=config.group,
+        name=config.name,
+        id=str(uuid.uuid4()),
+        save_code=True,
     )
-    actor = ActorTrainState.create(
-        apply_fn=actor_module.apply,
-        params=actor_module.init(actor_key, init_state),
-        target_params=actor_module.init(actor_key, init_state),
-        tx=optax.adam(learning_rate=config.actor_learning_rate),
-    )
+    wandb.run.save()
 
-    critic_module = EnsembleCritic(
-        hidden_dim=config.hidden_dim,
-        num_critics=2,
-        layernorm=config.critic_ln,
-        n_hiddens=config.critic_n_hiddens,
-    )
-    critic = CriticTrainState.create(
-        apply_fn=critic_module.apply,
-        params=critic_module.init(critic_key, init_state, init_action),
-        target_params=critic_module.init(critic_key, init_state, init_action),
-        tx=optax.adam(learning_rate=config.critic_learning_rate),
-    )
+    for epoch in trange(config.num_epochs, desc="Training"):
+        rng, update_rng = jax.random.split(rng)
 
-    update_td3_partial = partial(
-        update_td3,
-        gamma=config.gamma,
-        actor_bc_coef=config.actor_bc_coef,
-        critic_bc_coef=config.critic_bc_coef,
-        tau=config.tau,
-        policy_noise=config.policy_noise,
-        noise_clip=config.noise_clip,
-        normalize_q=config.normalize_q,
-    )
+        def td3_loop_update_step(carry, _):
+            (
+                rng,
+                actor_state,
+                critic_state,
+                target_critic_params,
+                log_alpha_state,
+                log_alpha,
+                metrics,
+            ) = carry
+            rng, key = jax.random.split(rng)
+            batch = replay_buffer.sample(config.batch_size)
+            (
+                rng,
+                actor_state,
+                critic_state,
+                target_critic_params,
+                log_alpha_state,
+                log_alpha,
+                update_metrics,
+            ) = update_fn(
+                key,
+                actor_state,
+                critic_state,
+                target_critic_params,
+                log_alpha_state,
+                log_alpha,
+                batch,
+            )
+            # update_metrics is a dict of individual metric values.
+            # We add them to the metrics of the current epoch to compute mean.
+            # metrics = metrics.update(update_metrics)
+            return (
+                rng,
+                actor_state,
+                critic_state,
+                target_critic_params,
+                log_alpha_state,
+                log_alpha,
+                update_metrics,
+            ), None
 
-    update_td3_no_targets_partial = partial(
-        update_td3_no_targets,
-        gamma=config.gamma,
-        actor_bc_coef=config.actor_bc_coef,
-        critic_bc_coef=config.critic_bc_coef,
-        tau=config.tau,
-        policy_noise=config.policy_noise,
-        noise_clip=config.noise_clip,
-    )
-
-    def td3_loop_update_step(i: int, carry: TrainState):
-        key, batch_key = jax.random.split(carry["key"])
-        batch = carry["buffer"].sample_batch(batch_key, batch_size=config.batch_size)
-
-        full_update = partial(
-            update_td3_partial,
-            key=key,
-            actor=carry["actor"],
-            critic=carry["critic"],
-            batch=batch,
-            metrics=carry["metrics"],
+        update_carry = (
+            update_rng,
+            actor_state,
+            critic_state,
+            target_critic_params,
+            log_alpha_state,
+            log_alpha,
+            None,
         )
 
-        update = partial(
-            update_td3_no_targets_partial,
-            key=key,
-            actor=carry["actor"],
-            critic=carry["critic"],
-            batch=batch,
-            metrics=carry["metrics"],
+        update_carry, _ = jax.lax.scan(
+            f=lambda carry, _: td3_loop_update_step(carry, _),
+            init=update_carry,
+            xs=None,
+            length=config.num_updates_on_epoch,
         )
 
-        key, new_actor, new_critic, new_metrics = jax.lax.cond(
-            update_carry["delayed_updates"][i], full_update, update
+        metrics_of_epoch = update_carry[6]
+        wandb.log(
+            {
+                "epoch": epoch,
+                "actor_loss": metrics_of_epoch["actor_loss"].mean(),
+                "critic_loss": metrics_of_epoch["critic_loss"].mean(),
+                "alpha_loss": metrics_of_epoch["alpha_loss"].mean(),
+                "alpha": metrics_of_epoch["alpha"].mean(),
+            }
         )
-
-        carry.update(key=key, actor=new_actor, critic=new_critic, metrics=new_metrics)
-        return carry
-
-    # metrics
-    bc_metrics_to_log = [
-        "critic_loss",
-        "q_min",
-        "actor_loss",
-        "batch_entropy",
-        "bc_mse_policy",
-        "bc_mse_random",
-        "action_mse",
-    ]
-    # shared carry for update loops
-    update_carry = {
-        "key": key,
-        "actor": actor,
-        "critic": critic,
-        "buffer": buffer,
-        "delayed_updates": jax.numpy.equal(
-            jax.numpy.arange(config.num_updates_on_epoch) % config.policy_freq, 0
-        ).astype(int),
-    }
-
-    @jax.jit
-    def actor_action_fn(params: jax.Array, obs: jax.Array):
-        return actor.apply_fn(params, obs)
-
-    for epoch in trange(config.num_epochs, desc="ReBRAC Epochs"):
-        # metrics for accumulation during epoch and logging to wandb
-        # we need to reset them every epoch
-        update_carry["metrics"] = Metrics.create(bc_metrics_to_log)
-
-        update_carry = jax.lax.fori_loop(
-            lower=0,
-            upper=config.num_updates_on_epoch,
-            body_fun=td3_loop_update_step,
-            init_val=update_carry,
-        )
-        # log mean over epoch for each metric
-        # mean_metrics = update_carry["metrics"].compute()
-        # wandb.log(
-        #     {"epoch": epoch, **{f"ReBRAC/{k}": v for k, v in mean_metrics.items()}}
-        # )
-
         if epoch % config.eval_every == 0 or epoch == config.num_epochs - 1:
             eval_returns = evaluate(
                 eval_env,
-                update_carry["actor"].params,
+                update_carry[1].params,
                 actor_action_fn,
                 config.eval_episodes,
                 seed=config.eval_seed,
+                state_mean=state_mean,
+                state_std=state_std,
             )
-            # normalized_score = eval_env.get_normalized_score(eval_returns) * 100.0
-            # wandb.log(
-            #     {
-            #         "epoch": epoch,
-            #         "eval/return_mean": np.mean(eval_returns),
-            #         "eval/return_std": np.std(eval_returns),
-            #         "eval/normalized_score_mean": np.mean(normalized_score),
-            #         "eval/normalized_score_std": np.std(normalized_score),
-            #     }
-            # )
+
+            wandb.log(
+                {
+                    "epoch": epoch,
+                    "eval/return_mean": np.mean(eval_returns),
+                    "eval/return_std": np.std(eval_returns),
+                }
+            )
+
             eval_score = eval_returns.mean()
             print("---------------------------------------")
             print(
@@ -824,7 +548,25 @@ def main(config: Config):
                 f"{eval_score:.3f} , Minari score mean: {eval_score:.3f}"
             )
             print("---------------------------------------")
+            if config.checkpoints_path is not None:
+                frozen_dict = FrozenDict(
+                    {
+                        "actor_state": update_carry[1],
+                        "critic_state": update_carry[2],
+                        "target_critic_params": update_carry[3],
+                        "log_alpha_state": update_carry[4],
+                        "log_alpha": update_carry[5],
+                        "state_mean": state_mean,
+                        "state_std": state_std,
+                    }
+                )
+                with open(
+                    os.path.join(config.checkpoints_path, f"{epoch}.pickle"), "wb"
+                ) as f:
+                    import pickle
+
+                    pickle.dump(frozen_dict, f)
 
 
 if __name__ == "__main__":
-    main()
+    train()

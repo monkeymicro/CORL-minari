@@ -44,6 +44,8 @@ class TrainConfig:
     batch_size: int = 10_000
     num_epochs: int = 300
     num_updates_on_epoch: int = 1000
+    normalize: bool = False  # Normalize states
+    normalize_reward: bool = False  # Normalize reward
     # evaluation params
     eval_episodes: int = 10
     eval_every: int = 5
@@ -68,6 +70,38 @@ TensorBatch = List[torch.Tensor]
 def soft_update(target: nn.Module, source: nn.Module, tau: float):
     for target_param, source_param in zip(target.parameters(), source.parameters()):
         target_param.data.copy_((1 - tau) * target_param.data + tau * source_param.data)
+
+
+def compute_mean_std(states: np.ndarray, eps: float = 1e-3) -> Tuple[np.ndarray, np.ndarray]:
+    mean = states.mean(0)
+    std = states.std(0) + eps
+    return mean, std
+
+
+def normalize_states(states: np.ndarray, mean: np.ndarray, std: np.ndarray):
+    return (states - mean) / std
+
+
+def wrap_env(
+    env: gym.Env,
+    state_mean: Union[np.ndarray, float] = 0.0,
+    state_std: Union[np.ndarray, float] = 1.0,
+    reward_scale: float = 1.0,
+) -> gym.Env:
+    # PEP 8: E731 do not assign a lambda expression, use a def
+    def normalize_state(state):
+        return (
+            state - state_mean
+        ) / state_std  # epsilon should be already added in std.
+
+    def scale_reward(reward):
+        # Please be careful, here reward is multiplied by scale!
+        return reward_scale * reward
+
+    env = gym.wrappers.TransformObservation(env, normalize_state)
+    if reward_scale != 1.0:
+        env = gym.wrappers.TransformReward(env, scale_reward)
+    return env
 
 
 def wandb_init(config: dict) -> None:
@@ -95,24 +129,6 @@ def set_seed(
     torch.use_deterministic_algorithms(deterministic_torch)
 
 
-def wrap_env(
-    env: gym.Env,
-    state_mean: Union[np.ndarray, float] = 0.0,
-    state_std: Union[np.ndarray, float] = 1.0,
-    reward_scale: float = 1.0,
-) -> gym.Env:
-    def normalize_state(state):
-        return (state - state_mean) / state_std
-
-    def scale_reward(reward):
-        return reward_scale * reward
-
-    env = gym.wrappers.TransformObservation(env, normalize_state)
-    if reward_scale != 1.0:
-        env = gym.wrappers.TransformReward(env, scale_reward)
-    return env
-
-
 class ReplayBuffer:
     def __init__(
         self,
@@ -120,6 +136,7 @@ class ReplayBuffer:
         action_dim: int,
         buffer_size: int,
         device: str = "cpu",
+        normalize_reward: bool = False
     ):
         self._buffer_size = buffer_size
         self._pointer = 0
@@ -137,6 +154,7 @@ class ReplayBuffer:
         )
         self._dones = torch.zeros((buffer_size, 1), dtype=torch.float32, device=device)
         self._device = device
+        self._normalize_reward = normalize_reward
 
     def _to_tensor(self, data: np.ndarray) -> torch.Tensor:
         return torch.tensor(data, dtype=torch.float32, device=self._device)
@@ -158,7 +176,19 @@ class ReplayBuffer:
         self._size += n_transitions
         self._pointer = min(self._size, n_transitions)
 
+        if self._normalize_reward:
+            self.normalize_rewards()
+
         print(f"Dataset size: {n_transitions}")
+
+    def normalize_rewards(self, eps: float = 1e-3) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Computes mean and std of rewards and normalizes them.
+        """
+        reward_mean = self._rewards.mean(dim=0, keepdim=True)
+        reward_std = self._rewards.std(dim=0, keepdim=True) + eps
+        self._rewards = (self._rewards - reward_mean) / reward_std
+        return reward_mean.cpu().numpy(), reward_std.cpu().numpy()
 
     def sample(self, batch_size: int) -> TensorBatch:
         indices = np.random.randint(0, min(self._size, self._pointer), size=batch_size)
@@ -174,45 +204,9 @@ class ReplayBuffer:
         raise NotImplementedError
 
 
-# SAC Actor & Critic implementation
-class VectorizedLinear(nn.Module):
-    def __init__(self, in_features: int, out_features: int, ensemble_size: int):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.ensemble_size = ensemble_size
-
-        self.weight = nn.Parameter(torch.empty(ensemble_size, in_features, out_features))
-        self.bias = nn.Parameter(torch.empty(ensemble_size, 1, out_features))
-
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        # default pytorch init for nn.Linear module
-        for layer in range(self.ensemble_size):
-            nn.init.kaiming_uniform_(self.weight[layer], a=math.sqrt(5))
-
-        fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight[0])
-        bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
-        nn.init.uniform_(self.bias, -bound, bound)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # input: [ensemble_size, batch_size, input_size]
-        # weight: [ensemble_size, input_size, out_size]
-        # out: [ensemble_size, batch_size, out_size]
-        return x @ self.weight + self.bias
-
-
 class Actor(nn.Module):
-    def __init__(
-        self,
-        state_dim: int,
-        action_dim: int,
-        hidden_dim: int,
-        edac_init: bool,
-        max_action: float = 1.0,
-    ):
-        super().__init__()
+    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int):
+        super(Actor, self).__init__()
         self.trunk = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
             nn.ReLU(),
@@ -221,404 +215,225 @@ class Actor(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
         )
-        # with separate layers works better than with Linear(hidden_dim, 2 * action_dim)
-        self.mu = nn.Linear(hidden_dim, action_dim)
-        self.log_sigma = nn.Linear(hidden_dim, action_dim)
+        self.mu_head = nn.Linear(hidden_dim, action_dim)
+        self.log_std_head = nn.Linear(hidden_dim, action_dim)
 
-        if edac_init:
-            # init as in the EDAC paper
-            for layer in self.trunk[::2]:
-                torch.nn.init.constant_(layer.bias, 0.1)
-
-            torch.nn.init.uniform_(self.mu.weight, -1e-3, 1e-3)
-            torch.nn.init.uniform_(self.mu.bias, -1e-3, 1e-3)
-            torch.nn.init.uniform_(self.log_sigma.weight, -1e-3, 1e-3)
-            torch.nn.init.uniform_(self.log_sigma.bias, -1e-3, 1e-3)
-
-        self.action_dim = action_dim
-        self.max_action = max_action
-
-    def forward(
-        self,
-        state: torch.Tensor,
-        deterministic: bool = False,
-        need_log_prob: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def forward(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         hidden = self.trunk(state)
-        mu, log_sigma = self.mu(hidden), self.log_sigma(hidden)
-
-        # clipping params from EDAC paper, not as in SAC paper (-20, 2)
-        log_sigma = torch.clip(log_sigma, -5, 2)
-        policy_dist = Normal(mu, torch.exp(log_sigma))
-
-        if deterministic:
-            action = mu
-        else:
-            action = policy_dist.rsample()
-
-        tanh_action, log_prob = torch.tanh(action), None
-        if need_log_prob:
-            # change of variables formula (SAC paper, appendix C, eq 21)
-            log_prob = policy_dist.log_prob(action).sum(axis=-1)
-            log_prob = log_prob - torch.log(1 - tanh_action.pow(2) + 1e-6).sum(axis=-1)
-
-        return tanh_action * self.max_action, log_prob
-
-    @torch.no_grad()
-    def act(self, state: np.ndarray, device: str) -> np.ndarray:
-        deterministic = not self.training
-        state = torch.tensor(state, device=device, dtype=torch.float32)
-        action = self(state, deterministic=deterministic)[0].cpu().numpy()
-        return action
+        mu = self.mu_head(hidden)
+        log_std = self.log_std_head(hidden)
+        log_std = torch.clamp(log_std, -20, 2)
+        return mu, log_std
 
 
-class VectorizedCritic(nn.Module):
-    def __init__(
-        self,
-        state_dim: int,
-        action_dim: int,
-        hidden_dim: int,
-        num_critics: int,
-        layernorm: bool,
-        edac_init: bool,
-    ):
-        super().__init__()
-        self.critic = nn.Sequential(
-            VectorizedLinear(state_dim + action_dim, hidden_dim, num_critics),
+class Critic(nn.Module):
+    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int, layernorm: bool = False):
+        super(Critic, self).__init__()
+        self.q_net = nn.Sequential(
+            nn.Linear(state_dim + action_dim, hidden_dim),
             nn.LayerNorm(hidden_dim) if layernorm else nn.Identity(),
             nn.ReLU(),
-            VectorizedLinear(hidden_dim, hidden_dim, num_critics),
-            nn.LayerNorm(hidden_dim) if layernorm else nn.Identity(),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            VectorizedLinear(hidden_dim, hidden_dim, num_critics),
-            nn.LayerNorm(hidden_dim) if layernorm else nn.Identity(),
-            nn.ReLU(),
-            VectorizedLinear(hidden_dim, 1, num_critics),
+            nn.Linear(hidden_dim, 1),
         )
-        if edac_init:
-            # init as in the EDAC paper
-            for layer in self.critic[::3]:
-                torch.nn.init.constant_(layer.bias, 0.1)
-
-            torch.nn.init.uniform_(self.critic[-1].weight, -3e-3, 3e-3)
-            torch.nn.init.uniform_(self.critic[-1].bias, -3e-3, 3e-3)
-
-        self.num_critics = num_critics
 
     def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        # [batch_size, state_dim + action_dim]
-        state_action = torch.cat([state, action], dim=-1)
-        # [num_critics, batch_size, state_dim + action_dim]
-        state_action = state_action.unsqueeze(0).repeat_interleave(
-            self.num_critics, dim=0
-        )
-        # [num_critics, batch_size]
-        q_values = self.critic(state_action).squeeze(-1)
-        return q_values
+        x = torch.cat([state, action], dim=-1)
+        return self.q_net(x).squeeze(-1)
+
+
+class EnsembleCritic(nn.Module):
+    def __init__(self, num_critics: int, state_dim: int, action_dim: int, hidden_dim: int, edac_init: bool = False,
+                 layernorm: bool = False):
+        super().__init__()
+        self.critics = nn.ModuleList([
+            Critic(state_dim, action_dim, hidden_dim, layernorm)
+            for _ in range(num_critics)
+        ])
+        if edac_init:
+            for critic in self.critics:
+                critic.q_net[-1].weight.data.uniform_(-3e-3, 3e-3)
+                critic.q_net[-1].bias.data.uniform_(-3e-3, 3e-3)
+
+    def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        qs = [critic(state, action) for critic in self.critics]
+        return torch.stack(qs, dim=0)
 
 
 class LBSAC:
-    def __init__(
-        self,
-        actor: Actor,
-        actor_optimizer: torch.optim.Optimizer,
-        critic: VectorizedCritic,
-        critic_optimizer: torch.optim.Optimizer,
-        gamma: float = 0.99,
-        tau: float = 0.005,
-        alpha_learning_rate: float = 1e-4,
-        device: str = "cpu",
-    ):
+    def __init__(self,
+                 actor: nn.Module,
+                 actor_optimizer: torch.optim.Optimizer,
+                 critic: EnsembleCritic,
+                 critic_optimizer: torch.optim.Optimizer,
+                 target_critic: EnsembleCritic,
+                 log_alpha: torch.Tensor,
+                 alpha_optimizer: torch.optim.Optimizer,
+                 gamma: float = 0.99,
+                 tau: float = 0.005,
+                 max_action: float = 1.0,
+                 device: str = "cpu"):
+
+        self.gamma = gamma
+        self.tau = tau
+        self.max_action = max_action
         self.device = device
 
         self.actor = actor
-        self.critic = critic
-        with torch.no_grad():
-            self.target_critic = deepcopy(self.critic)
-
         self.actor_optimizer = actor_optimizer
+
+        self.critic = critic
         self.critic_optimizer = critic_optimizer
+        self.target_critic = target_critic
 
-        self.tau = tau
-        self.gamma = gamma
-
-        # adaptive alpha setup
-        self.target_entropy = -float(self.actor.action_dim)
-        self.log_alpha = torch.tensor(
-            [0.0], dtype=torch.float32, device=self.device, requires_grad=True
-        )
-        self.alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=alpha_learning_rate)
-        self.alpha = self.log_alpha.exp().detach()
-
-    def _alpha_loss(self, state: torch.Tensor) -> torch.Tensor:
-        with torch.no_grad():
-            action, action_log_prob = self.actor(state, need_log_prob=True)
-
-        loss = (-self.log_alpha * (action_log_prob + self.target_entropy)).mean()
-
-        return loss
-
-    def _actor_loss(self, state: torch.Tensor) -> Tuple[torch.Tensor, float, float]:
-        action, action_log_prob = self.actor(state, need_log_prob=True)
-        q_value_dist = self.critic(state, action)
-        assert q_value_dist.shape[0] == self.critic.num_critics
-        q_value_min = q_value_dist.min(0).values
-        # needed for logging
-        q_value_std = q_value_dist.std(0).mean().item()
-        batch_entropy = -action_log_prob.mean().item()
-
-        assert action_log_prob.shape == q_value_min.shape
-        loss = (self.alpha * action_log_prob - q_value_min).mean()
-
-        return loss, batch_entropy, q_value_std
-
-    def _critic_loss(
-        self,
-        state: torch.Tensor,
-        action: torch.Tensor,
-        reward: torch.Tensor,
-        next_state: torch.Tensor,
-        done: torch.Tensor,
-    ) -> torch.Tensor:
-        with torch.no_grad():
-            next_action, next_action_log_prob = self.actor(
-                next_state, need_log_prob=True
-            )
-            q_next = self.target_critic(next_state, next_action).min(0).values
-            q_next = q_next - self.alpha * next_action_log_prob
-
-            assert q_next.unsqueeze(-1).shape == done.shape == reward.shape
-            q_target = reward + self.gamma * (1 - done) * q_next.unsqueeze(-1)
-
-        q_values = self.critic(state, action)
-        # [ensemble_size, batch_size] - [1, batch_size]
-        # loss = ((q_values - q_target.view(1, -1)) ** 2).mean(dim=1).sum(dim=0)
-        loss = ((q_values - q_target.view(1, -1)) ** 2).mean()
-
-        return loss
+        self.log_alpha = log_alpha
+        self.alpha_optimizer = alpha_optimizer
 
     def update(self, batch: TensorBatch) -> Dict[str, float]:
-        state, action, reward, next_state, done = [arr.to(self.device) for arr in batch]
-        # Usually updates are done in the following order: critic -> actor -> alpha
-        # But we found that EDAC paper uses reverse (which gives better results)
+        states, actions, rewards, next_states, dones = batch
 
-        # Alpha update
-        alpha_loss = self._alpha_loss(state)
-        self.alpha_optimizer.zero_grad()
-        alpha_loss.backward()
-        self.alpha_optimizer.step()
+        # --- Update critic ---
+        with torch.no_grad():
+            mu, log_std = self.actor(next_states)
+            policy_dist = Normal(mu, torch.exp(log_std))
+            next_actions = policy_dist.sample()
+            next_actions = torch.tanh(next_actions) * self.max_action
+            log_prob = policy_dist.log_prob(torch.atanh(next_actions / self.max_action + 1e-6)).sum(
+                axis=-1) - torch.log(1 - next_actions.pow(2) + 1e-6).sum(axis=-1)
+            target_q = self.target_critic(next_states, next_actions)
+            min_target_q = target_q.min(0)[0].squeeze(-1)
+            target_q = (rewards + self.gamma * (1 - dones.squeeze(-1)) * min_target_q)
+        q_predictions = self.critic(states, actions)
+        critic_loss = F.mse_loss(q_predictions, target_q.unsqueeze(0).repeat(self.critic.num_critics, 1), reduction="mean")
+        self.critic_optimizer.zero_grad()
+        critic_loss.backward()
+        self.critic_optimizer.step()
+        soft_update(self.target_critic, self.critic, self.tau)
 
-        self.alpha = self.log_alpha.exp().detach()
-
-        # Actor update
-        actor_loss, actor_batch_entropy, q_policy_std = self._actor_loss(state)
+        # --- Update actor ---
+        mu, log_std = self.actor(states)
+        policy_dist = Normal(mu, torch.exp(log_std))
+        actions_pi = policy_dist.sample()
+        actions_pi = torch.tanh(actions_pi) * self.max_action
+        with torch.no_grad():
+            q_values = self.critic(states, actions_pi)
+            min_q_values = q_values.min(0)[0]
+        actor_loss = ((self.alpha.detach() * policy_dist.log_prob(actions_pi).sum(axis=-1) - min_q_values).mean())
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
         self.actor_optimizer.step()
 
-        # Critic update
-        critic_loss = self._critic_loss(state, action, reward, next_state, done)
-        self.critic_optimizer.zero_grad()
-        critic_loss.backward()
-        self.critic_optimizer.step()
+        # --- Update alpha ---
+        alpha_loss = (self.alpha * (-log_prob - self.target_entropy).detach()).mean()
+        self.alpha_optimizer.zero_grad()
+        alpha_loss.backward()
+        self.alpha_optimizer.step()
 
-        #  Target networks soft update
-        with torch.no_grad():
-            soft_update(self.target_critic, self.critic, tau=self.tau)
-            # for logging, Q-ensemble std estimate with the random actions:
-            # a ~ U[-max_action, max_action]
-            max_action = self.actor.max_action
-            random_actions = -max_action + 2 * max_action * torch.rand_like(action)
-
-            q_random_std = self.critic(state, random_actions).std(0).mean().item()
-
-        update_info = {
-            "alpha_loss": alpha_loss.item(),
+        return {
             "critic_loss": critic_loss.item(),
             "actor_loss": actor_loss.item(),
-            "batch_entropy": actor_batch_entropy,
-            "alpha": self.alpha.item(),
-            "q_policy_std": q_policy_std,
-            "q_random_std": q_random_std,
+            "alpha_loss": alpha_loss.item(),
+            "alpha": self.alpha.item()
         }
-        return update_info
+
+    @property
+    def alpha(self):
+        return self.log_alpha.exp()
 
     def state_dict(self) -> Dict[str, Any]:
-        state = {
+        return {
             "actor": self.actor.state_dict(),
             "critic": self.critic.state_dict(),
             "target_critic": self.target_critic.state_dict(),
-            "log_alpha": self.log_alpha.item(),
-            "actor_optim": self.actor_optimizer.state_dict(),
-            "critic_optim": self.critic_optimizer.state_dict(),
-            "alpha_optim": self.alpha_optimizer.state_dict(),
+            "actor_optimizer": self.actor_optimizer.state_dict(),
+            "critic_optimizer": self.critic_optimizer.state_dict(),
+            "log_alpha": self.log_alpha.state_dict(),
+            "alpha_optimizer": self.alpha_optimizer.state_dict()
         }
-        return state
 
     def load_state_dict(self, state_dict: Dict[str, Any]):
         self.actor.load_state_dict(state_dict["actor"])
         self.critic.load_state_dict(state_dict["critic"])
         self.target_critic.load_state_dict(state_dict["target_critic"])
-        self.actor_optimizer.load_state_dict(state_dict["actor_optim"])
-        self.critic_optimizer.load_state_dict(state_dict["critic_optim"])
-        self.alpha_optimizer.load_state_dict(state_dict["alpha_optim"])
-        self.log_alpha.data[0] = state_dict["log_alpha"]
-        self.alpha = self.log_alpha.exp().detach()
+        self.actor_optimizer.load_state_dict(state_dict["actor_optimizer"])
+        self.critic_optimizer.load_state_dict(state_dict["critic_optimizer"])
+        self.log_alpha.load_state_dict(state_dict["log_alpha"])
+        self.alpha_optimizer.load_state_dict(state_dict["alpha_optimizer"])
 
-
-@torch.no_grad()
-def eval_actor(
-    env: gym.Env, actor: nn.Module, device: str, n_episodes: int, seed: int
-) -> np.ndarray:
-    # env.seed(seed)
-    actor.eval()
-    episode_rewards = []
-    for _ in range(n_episodes):
-        state, _ = env.reset(seed=seed)
-        done = False
-        episode_reward = 0.0
-        while not done:
-            action = actor.act(torch.FloatTensor(state), device)
-            # state, reward, done, _ = env.step(action)
-            state, reward, terminated, truncated, _= env.step(action)
-            done = terminated or truncated
-            episode_reward += reward
-        episode_rewards.append(episode_reward)
-
-    actor.train()
-    return np.asarray(episode_rewards)
-
-# 假设你已有的 ReplayBuffer 类如下（简化）：
-class SimpleReplayBuffer:
-    def __init__(self, obs_dim: int, action_dim: int, size: int,):
-        self._states = np.zeros([size, obs_dim], dtype=np.float32)
-        self._actions = np.zeros([size, action_dim], dtype=np.float32)
-        self._rewards = np.zeros([size], dtype=np.float32)
-        self._next_states = np.zeros([size, obs_dim], dtype=np.float32)
-        self._dones = np.zeros([size], dtype=np.float32)
-        self.max_size = size
-        self.ptr, self.size, = 0, 0
-    def store(self, obs: np.ndarray,
-        act: np.ndarray, 
-        rew: float, 
-        next_obs: np.ndarray, 
-        done: float,):
-
-        self._states[self.ptr] = obs
-        self._next_states[self.ptr] = next_obs
-        self._actions[self.ptr] = act
-        self._rewards[self.ptr] = rew
-        self._dones[self.ptr] = done
-        self.ptr = (self.ptr + 1) % self.max_size
-        self.size = min(self.size + 1, self.max_size)
-        # print(f"Loaded {len(data['observations'])} transitions.")
 
 @pyrallis.wrap()
 def train(config: TrainConfig):
-    # set_seed(config.train_seed, deterministic_torch=config.deterministic_torch)
-    # wandb_init(asdict(config))
-
-    # # data, evaluation, env setup
-    # eval_env = wrap_env(gym.make(config.env_name))
-    # state_dim = eval_env.observation_space.shape[0]
-    # action_dim = eval_env.action_space.shape[0]
-
-    # d4rl_dataset = d4rl.qlearning_dataset(eval_env)
-    # print("Buffer size: ", d4rl_dataset["actions"].shape[0])
-
-    # buffer = ReplayBuffer(
-    #     state_dim=state_dim,
-    #     action_dim=action_dim,
-    #     buffer_size=config.buffer_size,
-    #     device=config.device,
-    # )
-    # buffer.load_d4rl_dataset(d4rl_dataset)
-    manari_dataset = minari.load_dataset(config.env_name)
-    print('minari dataset len is :', manari_dataset.total_steps)
-    # 获取维度信息
-    state_dim = manari_dataset.observation_space.shape[0]
-    action_dim = manari_dataset.action_space.shape[0]
-
-    # 创建你的 ReplayBuffer
-    buffer = SimpleReplayBuffer(state_dim, action_dim, manari_dataset.total_steps)
-
-    # 使用 iterate_episodes 来提取数据
-    for ep in manari_dataset.iterate_episodes():
-        for i in range(ep.observations.shape[0] - 1):
-            obs = ep.observations[i]
-            # print(obs)
-            next_obs = ep.observations[i+1]
-            action = ep.actions[i]
-            reward = ep.rewards[i]
-            done = (ep.terminations | ep.truncations)[i].astype(np.float32)
-
-            buffer.store(obs, action, reward, next_obs, done)
-
-    print("Replay buffer filled.")
+    set_seed(config.train_seed, deterministic_torch=config.deterministic_torch)
+    eval_env = gym.make(config.env_name)
+    eval_env.seed(config.eval_seed)
     
-    dataset = {
-            "observations": buffer._states,
-            "actions": buffer._actions,
-            "rewards": buffer._rewards,
-            "next_observations": buffer._next_states,
-            "terminals": buffer._dones,
-        }
+    dataset = minari.load_dataset(config.env_name, seed=None)
+    state_dim = dataset.observations.shape[1]
+    action_dim = dataset.actions.shape[1]
+
+    if config.normalize:
+        state_mean, state_std = compute_mean_std(dataset.observations, eps=1e-3)
+        dataset.observations = normalize_states(dataset.observations, state_mean, state_std)
+    else:
+        state_mean, state_std = 0, 1
 
     replay_buffer = ReplayBuffer(
         state_dim,
         action_dim,
-        manari_dataset.total_steps,
+        config.buffer_size,
         config.device,
+        config.normalize_reward
     )
     replay_buffer.load_minari_dataset(dataset)
-    eval_env = gym.make('Hopper-v5', ctrl_cost_weight=1e-3)
-    # Actor & Critic setup
-    actor = Actor(
-        state_dim, action_dim, config.hidden_dim, config.edac_init, config.max_action
-    )
-    actor.to(config.device)
-    actor_optimizer = torch.optim.Adam(actor.parameters(), lr=config.actor_learning_rate)
-    critic = VectorizedCritic(
-        state_dim,
-        action_dim,
-        config.hidden_dim,
-        config.num_critics,
-        config.critic_layernorm,
-        config.edac_init,
-    )
-    critic.to(config.device)
-    critic_optimizer = torch.optim.Adam(
-        critic.parameters(), lr=config.critic_learning_rate
-    )
 
-    trainer = LBSAC(
-        actor=actor,
-        actor_optimizer=actor_optimizer,
-        critic=critic,
-        critic_optimizer=critic_optimizer,
-        gamma=config.gamma,
-        tau=config.tau,
-        alpha_learning_rate=config.alpha_learning_rate,
-        device=config.device,
-    )
-    # saving config to the checkpoint
+    actor = Actor(state_dim, action_dim, config.hidden_dim).to(config.device)
+    actor_optimizer = torch.optim.Adam(actor.parameters(), lr=config.actor_learning_rate)
+
+    critic = EnsembleCritic(config.num_critics, state_dim, action_dim, config.hidden_dim, config.edac_init, config.critic_layernorm).to(config.device)
+    target_critic = deepcopy(critic).to(config.device)
+    critic_optimizer = torch.optim.Adam(critic.parameters(), lr=config.critic_learning_rate)
+
+    log_alpha = torch.zeros(1, requires_grad=True, device=config.device)
+    alpha_optimizer = torch.optim.Adam([log_alpha], lr=config.alpha_learning_rate)
+    
+    kwargs = {
+        "actor": actor,
+        "actor_optimizer": actor_optimizer,
+        "critic": critic,
+        "critic_optimizer": critic_optimizer,
+        "target_critic": target_critic,
+        "log_alpha": log_alpha,
+        "alpha_optimizer": alpha_optimizer,
+        "gamma": config.gamma,
+        "tau": config.tau,
+        "max_action": config.max_action,
+        "device": config.device
+    }
+
+    trainer = LBSAC(**kwargs)
+    
     if config.checkpoints_path is not None:
         print(f"Checkpoints path: {config.checkpoints_path}")
         os.makedirs(config.checkpoints_path, exist_ok=True)
         with open(os.path.join(config.checkpoints_path, "config.yaml"), "w") as f:
             pyrallis.dump(config, f)
 
+    wandb_init(asdict(config))
+
     total_updates = 0.0
+    evaluations = []
     for epoch in trange(config.num_epochs, desc="Training"):
         # training
         for _ in trange(config.num_updates_on_epoch, desc="Epoch", leave=False):
-            batch = buffer.sample(config.batch_size)
+            batch = replay_buffer.sample(config.batch_size)
+            batch = [b.to(config.device) for b in batch]
             update_info = trainer.update(batch)
 
-            # if total_updates % config.log_every == 0:
-            #     wandb.log({"epoch": epoch, **update_info})
-
             total_updates += 1
+
+            if total_updates % config.log_every == 0:
+                wandb.log({"epoch": epoch, **update_info}, step=total_updates)
 
         # evaluation
         if epoch % config.eval_every == 0 or epoch == config.num_epochs - 1:
@@ -628,18 +443,21 @@ def train(config: TrainConfig):
                 n_episodes=config.eval_episodes,
                 seed=config.eval_seed,
                 device=config.device,
+                state_mean=state_mean,
+                state_std=state_std,
             )
-            # eval_log = {
-            #     "eval/reward_mean": np.mean(eval_returns),
-            #     "eval/reward_std": np.std(eval_returns),
-            #     "epoch": epoch,
-            # }
-            # if hasattr(eval_env, "get_normalized_score"):
-            #     normalized_score = eval_env.get_normalized_score(eval_returns) * 100.0
-            #     eval_log["eval/normalized_score_mean"] = np.mean(normalized_score)
-            #     eval_log["eval/normalized_score_std"] = np.std(normalized_score)
+            eval_log = {
+                "eval/reward_mean": np.mean(eval_returns),
+                "eval/reward_std": np.std(eval_returns),
+                "epoch": epoch,
+            }
+            if hasattr(eval_env, "get_normalized_score"):
+                normalized_score = eval_env.get_normalized_score(eval_returns) * 100.0
+                eval_log["eval/normalized_score_mean"] = np.mean(normalized_score)
+                eval_log["eval/normalized_score_std"] = np.std(normalized_score)
 
-            # wandb.log(eval_log)
+            wandb.log(eval_log, step=total_updates)
+            
             eval_score = eval_returns.mean()
             print("---------------------------------------")
             print(
@@ -653,8 +471,35 @@ def train(config: TrainConfig):
                     os.path.join(config.checkpoints_path, f"{epoch}.pt"),
                 )
 
-    # wandb.finish()
+
+@torch.no_grad()
+def eval_actor(
+    env: gym.Env,
+    actor: Actor,
+    n_episodes: int,
+    seed: int,
+    device: str,
+    state_mean: Union[np.ndarray, float],
+    state_std: Union[np.ndarray, float],
+) -> np.ndarray:
+    actor.eval()
+    episode_rewards = []
+    for i in range(n_episodes):
+        state, _ = env.reset(seed=seed + i)
+        done = False
+        episode_reward = 0.0
+        while not done:
+            state_normalized = (state - state_mean) / state_std
+            mu, _ = actor(torch.tensor(state_normalized, device=device))
+            action = torch.tanh(mu).cpu().numpy()
+            state, reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
+            episode_reward += reward
+        episode_rewards.append(episode_reward)
+
+    actor.train()
+    return np.asarray(episode_rewards)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     train()

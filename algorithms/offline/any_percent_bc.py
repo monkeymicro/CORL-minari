@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import wandb
+from tqdm import trange
 
 TensorBatch = List[torch.Tensor]
 
@@ -35,6 +36,7 @@ class TrainConfig:
     frac: float = 0.1  # Best data fraction to use
     max_traj_len: int = 1000  # Max trajectory length
     normalize: bool = True  # Normalize states
+    normalize_reward: bool = True  # Normalize rewards
     # Wandb logging
     project: str = "CORL"
     group: str = "BC-D4RL"
@@ -112,7 +114,7 @@ class ReplayBuffer:
         return torch.tensor(data, dtype=torch.float32, device=self._device)
 
     # Loads data in d4rl format, i.e. from Dict[str, np.array].
-    def load_d4rl_dataset(self, data: Dict[str, np.ndarray]):
+    def load_d4rl_dataset(self, data: Dict[str, np.ndarray], normalize_reward: bool):
         if self._size != 0:
             raise ValueError("Trying to load data into non-empty replay buffer")
         n_transitions = data["observations"].shape[0]
@@ -128,7 +130,19 @@ class ReplayBuffer:
         self._size += n_transitions
         self._pointer = min(self._size, n_transitions)
 
+        if normalize_reward:
+            self.normalize_rewards()
+
         print(f"Dataset size: {n_transitions}")
+
+    def normalize_rewards(self, eps: float = 1e-3) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Computes mean and std of rewards and normalizes them.
+        """
+        reward_mean = self._rewards.mean(dim=0, keepdim=True)
+        reward_std = self._rewards.std(dim=0, keepdim=True) + eps
+        self._rewards = (self._rewards - reward_mean) / reward_std
+        return reward_mean.cpu().numpy(), reward_std.cpu().numpy()
 
     def sample(self, batch_size: int) -> TensorBatch:
         indices = np.random.randint(0, min(self._size, self._pointer), size=batch_size)
@@ -171,7 +185,13 @@ def wandb_init(config: dict) -> None:
 
 @torch.no_grad()
 def eval_actor(
-    env: gym.Env, actor: nn.Module, device: str, n_episodes: int, seed: int
+    env: gym.Env,
+    actor: nn.Module,
+    device: str,
+    n_episodes: int,
+    seed: int,
+    state_mean: Union[np.ndarray, float],
+    state_std: Union[np.ndarray, float],
 ) -> np.ndarray:
     env.seed(seed)
     actor.eval()
@@ -180,7 +200,8 @@ def eval_actor(
         state, done = env.reset(), False
         episode_reward = 0.0
         while not done:
-            action = actor.act(state, device)
+            state_normalized = (state - state_mean) / state_std
+            action = actor.act(state_normalized, device)
             state, reward, done, _ = env.step(action)
             episode_reward += reward
         episode_rewards.append(episode_reward)
@@ -312,20 +333,13 @@ def train(config: TrainConfig):
     else:
         state_mean, state_std = 0, 1
 
-    dataset["observations"] = normalize_states(
-        dataset["observations"], state_mean, state_std
-    )
-    dataset["next_observations"] = normalize_states(
-        dataset["next_observations"], state_mean, state_std
-    )
-    env = wrap_env(env, state_mean=state_mean, state_std=state_std)
     replay_buffer = ReplayBuffer(
         state_dim,
         action_dim,
         config.buffer_size,
         config.device,
     )
-    replay_buffer.load_d4rl_dataset(dataset)
+    replay_buffer.load_d4rl_dataset(dataset, normalize_reward=config.normalize_reward)
 
     if config.checkpoints_path is not None:
         print(f"Checkpoints path: {config.checkpoints_path}")
@@ -379,6 +393,8 @@ def train(config: TrainConfig):
                 device=config.device,
                 n_episodes=config.n_episodes,
                 seed=config.seed,
+                state_mean=state_mean,
+                state_std=state_std,
             )
             eval_score = eval_scores.mean()
             normalized_eval_score = env.get_normalized_score(eval_score) * 100.0

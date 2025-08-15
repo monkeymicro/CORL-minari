@@ -36,6 +36,7 @@ class TrainConfig:
     batch_size: int = 256
     eval_frequency: int = 1000
     n_test_episodes: int = 10
+    normalize: bool = False  # Add state normalization flag
     normalize_reward: bool = False
 
     hidden_dim: int = 256
@@ -48,6 +49,28 @@ class TrainConfig:
         self.name = f"{self.name}-{self.env_name}-{str(uuid.uuid4())[:8]}"
         if self.checkpoints_path is not None:
             self.checkpoints_path = os.path.join(self.checkpoints_path, self.name)
+
+
+def compute_mean_std(states: np.ndarray, eps: float) -> Tuple[np.ndarray, np.ndarray]:
+    mean = states.mean(0)
+    std = states.std(0) + eps
+    return mean, std
+
+
+def normalize_states(states: np.ndarray, mean: np.ndarray, std: np.ndarray):
+    return (states - mean) / std
+
+
+def wrap_env(
+    env: gym.Env,
+    state_mean: Union[np.ndarray, float] = 0.0,
+    state_std: Union[np.ndarray, float] = 1.0,
+) -> gym.Env:
+    def normalize_state(state):
+        return (state - state_mean) / state_std
+
+    env = gym.wrappers.TransformObservation(env, normalize_state)
+    return env
 
 
 class ReplayBuffer:
@@ -79,7 +102,7 @@ class ReplayBuffer:
         return torch.tensor(data, dtype=torch.float32, device=self._device)
 
     # Loads data in minari, i.e. from Dict[str, np.array].
-    def load_minari_dataset(self, data: Dict[str, np.ndarray]):
+    def load_minari_dataset(self, data: Dict[str, np.ndarray], normalize_reward: bool):
         if self._size != 0:
             raise ValueError("Trying to load data into non-empty replay buffer")
         n_transitions = data["observations"].shape[0]
@@ -95,7 +118,19 @@ class ReplayBuffer:
         self._size += n_transitions
         self._pointer = min(self._size, n_transitions)
 
+        if normalize_reward:
+            self.normalize_rewards()
+
         print(f"Dataset size: {n_transitions}")
+
+    def normalize_rewards(self, eps: float = 1e-3) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Computes mean and std of rewards and normalizes them.
+        """
+        reward_mean = self._rewards.mean(dim=0, keepdim=True)
+        reward_std = self._rewards.std(dim=0, keepdim=True) + eps
+        self._rewards = (self._rewards - reward_mean) / reward_std
+        return reward_mean.cpu().numpy(), reward_std.cpu().numpy()
 
     def sample(self, batch_size: int) -> TensorBatch:
         indices = np.random.randint(0, min(self._size, self._pointer), size=batch_size)
@@ -316,31 +351,15 @@ def set_seed(
     torch.use_deterministic_algorithms(deterministic_torch)
 
 
-def compute_mean_std(states: np.ndarray, eps: float) -> Tuple[np.ndarray, np.ndarray]:
-    mean = states.mean(0)
-    std = states.std(0) + eps
-    return mean, std
-
-
-def normalize_states(states: np.ndarray, mean: np.ndarray, std: np.ndarray):
-    return (states - mean) / std
-
-
-def wrap_env(
-    env: gym.Env,
-    state_mean: Union[np.ndarray, float] = 0.0,
-    state_std: Union[np.ndarray, float] = 1.0,
-) -> gym.Env:
-    def normalize_state(state):
-        return (state - state_mean) / state_std
-
-    env = gym.wrappers.TransformObservation(env, normalize_state)
-    return env
-
-
 @torch.no_grad()
 def eval_actor(
-    env: gym.Env, actor: nn.Module, device: str, n_episodes: int, seed: int
+    env: gym.Env,
+    actor: nn.Module,
+    device: str,
+    n_episodes: int,
+    seed: int,
+    state_mean: Union[np.ndarray, float],
+    state_std: Union[np.ndarray, float],
 ) -> np.ndarray:
     # env.seed(seed)
     actor.eval()
@@ -350,7 +369,8 @@ def eval_actor(
         done = False
         episode_reward = 0.0
         while not done:
-            action = actor.act(torch.FloatTensor(state), device)
+            state_normalized = (state - state_mean) / state_std
+            action = actor.act(torch.FloatTensor(state_normalized), device)
             # state, reward, done, _ = env.step(action)
             state, reward, terminated, truncated, _= env.step(action)
             done = terminated or truncated
@@ -385,16 +405,6 @@ def modify_reward(dataset, env_name, max_episode_steps=1000):
         dataset["rewards"] -= 1.0
 
 
-def wandb_init(config: dict) -> None:
-    wandb.init(
-        config=config,
-        project=config["project"],
-        group=config["group"],
-        name=config["name"],
-        id=str(uuid.uuid4()),
-    )
-    wandb.run.save()
-
 # 假设你已有的 ReplayBuffer 类如下（简化）：
 class SimpleReplayBuffer:
     def __init__(self, obs_dim: int, action_dim: int, size: int,):
@@ -406,47 +416,21 @@ class SimpleReplayBuffer:
         self.max_size = size
         self.ptr, self.size, = 0, 0
     def store(self, obs: np.ndarray,
-        act: np.ndarray, 
-        rew: float, 
-        next_obs: np.ndarray, 
+        act: np.ndarray,
+        rew: float,
+        next_obs: np.ndarray,
         done: float,):
 
         self._states[self.ptr] = obs
         self._next_states[self.ptr] = next_obs
         self._actions[self.ptr] = act
         self._rewards[self.ptr] = rew
-        self._dones[self.ptr] = done
         self.ptr = (self.ptr + 1) % self.max_size
         self.size = min(self.size + 1, self.max_size)
-        # print(f"Loaded {len(data['observations'])} transitions.")
+
 
 @pyrallis.wrap()
 def train(config: TrainConfig):
-    # env = gym.make(config.env_name)
-    # set_seed(config.seed, env, deterministic_torch=config.deterministic_torch)
-    # state_dim = env.observation_space.shape[0]
-    # action_dim = env.action_space.shape[0]
-    # dataset = d4rl.qlearning_dataset(env)
-
-    # if config.normalize_reward:
-    #     modify_reward(dataset, config.env_name)
-
-    # state_mean, state_std = compute_mean_std(dataset["observations"], eps=1e-3)
-    # dataset["observations"] = normalize_states(
-    #     dataset["observations"], state_mean, state_std
-    # )
-    # dataset["next_observations"] = normalize_states(
-    #     dataset["next_observations"], state_mean, state_std
-    # )
-    # env = wrap_env(env, state_mean=state_mean, state_std=state_std)
-    # replay_buffer = ReplayBuffer(
-    #     state_dim,
-    #     action_dim,
-    #     config.buffer_size,
-    #     config.device,
-    # )
-    # replay_buffer.load_d4rl_dataset(dataset)
-
     manari_dataset = minari.load_dataset(config.env_name)
     print('minari dataset len is :', manari_dataset.total_steps)
     # 获取维度信息
@@ -469,7 +453,7 @@ def train(config: TrainConfig):
             buffer.store(obs, action, reward, next_obs, done)
 
     print("Replay buffer filled.")
-    
+
     dataset = {
             "observations": buffer._states,
             "actions": buffer._actions,
@@ -478,13 +462,24 @@ def train(config: TrainConfig):
             "terminals": buffer._dones,
         }
 
+    if config.normalize:
+        state_mean, state_std = compute_mean_std(dataset["observations"], eps=1e-3)
+        dataset["observations"] = normalize_states(
+            dataset["observations"], state_mean, state_std
+        )
+        dataset["next_observations"] = normalize_states(
+            dataset["next_observations"], state_mean, state_std
+        )
+    else:
+        state_mean, state_std = 0, 1
+
     replay_buffer = ReplayBuffer(
         state_dim,
         action_dim,
         manari_dataset.total_steps,
         config.device,
     )
-    replay_buffer.load_minari_dataset(dataset)
+    replay_buffer.load_minari_dataset(dataset, normalize_reward=config.normalize_reward)
     env = gym.make('Hopper-v5', ctrl_cost_weight=1e-3)
 
     actor_critic_kwargs = {
@@ -529,7 +524,13 @@ def train(config: TrainConfig):
         # wandb.log(update_result, step=t)
         if (t + 1) % config.eval_frequency == 0:
             eval_scores = eval_actor(
-                env, actor, config.device, config.n_test_episodes, config.test_seed
+                env,
+                actor,
+                config.device,
+                config.n_test_episodes,
+                config.test_seed,
+                state_mean=state_mean,
+                state_std=state_std,
             )
 
             # wandb.log({"eval_score": eval_scores.mean()}, step=t)
