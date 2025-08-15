@@ -371,7 +371,6 @@ def eval_actor(
         while not done:
             state_normalized = (state - state_mean) / state_std
             action = actor.act(torch.FloatTensor(state_normalized), device)
-            # state, reward, done, _ = env.step(action)
             state, reward, terminated, truncated, _= env.step(action)
             done = terminated or truncated
             episode_reward += reward
